@@ -1,0 +1,165 @@
+---
+title: "Transcripts expression for Prom1"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: yes
+    code_folding: hide
+---
+
+# Abstract
+Compare Prom1 isoforms expression among retina samples.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE,
+                      warning = FALSE)
+```
+
+```{r}
+library(data.table)
+library(readr)
+library(tidyverse)
+library(ggplot2)
+library(DESeq2)
+library(ashr)
+library(pheatmap)
+library(RColorBrewer)
+library(fdrtool)
+library(EnhancedVolcano)
+library(writexl)
+library(DT)
+setwd("/home/ubuntu/Ocular-Prom1-Isoform")
+```
+
+# load filtered expression table 
+```{r}
+GSE104827 <- data.frame(fread("data/GSE104827/output/star_salmon/salmon.merged.transcript_tpm.tsv"))
+GSE137311 <- data.frame(fread("data/GSE137311/output/star_salmon/salmon.merged.transcript_tpm.tsv"))
+GSE94437 <- data.frame(fread("data/GSE94437/output/star_salmon/salmon.merged.transcript_tpm.tsv"))
+SRP222833 <- data.frame(fread("data/SRP222833/output/star_salmon/salmon.merged.transcript_tpm.tsv"))
+```
+
+# filter isoforms
+```{r}
+ensembl_anno <- read_csv("transcripts-Summary-Homo_sapiens_Transcript_Summary_ENST00000447510.csv", show_col_types = FALSE)
+trid <- as.vector(data.frame(ensembl_anno[, 1]))$Transcript.ID
+isoforms <-  gsub("\\.[0-9]+", "", trid)
+
+GSE104827_gene <- GSE104827[, -2] %>% filter(tx %in% isoforms)
+GSE137311_gene <- GSE137311[, -2] %>% filter(tx %in% isoforms)
+GSE94437_gene <- GSE94437[, -2] %>% filter(tx %in% isoforms)
+SRP222833_gene <- SRP222833[, -2] %>% filter(tx %in% isoforms)
+```
+
+# Plot isoforms expression {.tabset}
+## GSE104827
+* Transcripts expression TPM
+```{r}
+write_xlsx(GSE104827_gene, "transcripts_expression_TPM.GSE104827.xlsx")
+    GSE104827_gene %>%
+        mutate_if(is.numeric, round, digits = 2) %>%
+        datatable(extensions = "Buttons", options = list(dom = "Blfrtip", buttons = c("csv",
+            "excel"), lengthMenu = list(c(10, 25, 50, -1), c(10, 25, 50, "All"))))
+```
+
+```{r, fig.width=12, fig.height=30}
+toplot_GSE104827 <- GSE104827_gene %>% gather("Sample", "TPM", -tx)
+
+p <- ggplot(toplot_GSE104827, aes(x = TPM, y = tx)) +
+  geom_col(aes(fill = tx)) +
+  facet_wrap(~Sample, ncol = 4) +
+  ggtitle("GSE104827") +
+  scale_y_discrete(limits = rev) +
+  # theme_classic() +
+  theme(plot.margin = margin(10, 10, 10, 10),
+      plot.title = element_text(hjust = 0.5),
+      axis.text = element_text(size = 10),
+      axis.text.x = element_text(size = 10,  hjust = 1),
+      axis.title = element_text(size = 12, face = "bold"),
+      legend.position = "right")
+print(p)
+```
+
+## GSE137311
+* Transcripts expression TPM
+```{r}
+write_xlsx(GSE137311_gene, "transcripts_expression_TPM.GSE137311.xlsx")
+    GSE137311_gene %>%
+        mutate_if(is.numeric, round, digits = 2) %>%
+        datatable(extensions = "Buttons", options = list(dom = "Blfrtip", buttons = c("csv",
+            "excel"), lengthMenu = list(c(10, 25, 50, -1), c(10, 25, 50, "All"))))
+```
+```{r, fig.width=10, fig.height=6}
+toplot_GSE137311 <- GSE137311_gene %>% gather("Sample", "TPM", -tx)
+
+p <- ggplot(toplot_GSE137311, aes(x = TPM, y = tx)) +
+  geom_col(aes(fill = tx)) +
+  facet_wrap(~Sample, ncol = 4) +
+  ggtitle("GSE137311") +
+  scale_y_discrete(limits = rev) +
+  # theme_classic() +
+  theme(plot.margin = margin(10, 10, 10, 10),
+      plot.title = element_text(hjust = 0.5),
+      axis.text = element_text(size = 10),
+      axis.text.x = element_text(size = 10, hjust = 1),
+      axis.title = element_text(size = 12, face = "bold"),
+      legend.position = "right")
+print(p)
+```
+
+## GSE94437
+* Transcripts expression TPM
+```{r}
+write_xlsx(GSE94437_gene, "transcripts_expression_TPM.GSE94437.xlsx")
+    GSE94437_gene %>%
+        mutate_if(is.numeric, round, digits = 2) %>%
+        datatable(extensions = "Buttons", options = list(dom = "Blfrtip", buttons = c("csv",
+            "excel"), lengthMenu = list(c(10, 25, 50, -1), c(10, 25, 50, "All"))))
+```
+```{r, fig.width=14, fig.height=40}
+toplot_GSE94437 <- GSE94437_gene %>% gather("Sample", "TPM", -tx)
+
+p <- ggplot(toplot_GSE94437, aes(x = TPM, y = tx)) +
+  geom_col(aes(fill = tx)) +
+  facet_wrap(~Sample, ncol = 4) +
+  ggtitle("GSE94437") +
+  scale_y_discrete(limits = rev) +
+  # theme_classic() +
+  theme(plot.margin = margin(10, 10, 10, 10),
+      plot.title = element_text(hjust = 0.5),
+      axis.text = element_text(size = 10),
+      axis.text.x = element_text(size = 10,  hjust = 1),
+      axis.title = element_text(size = 12, face = "bold"),
+      legend.position = "right")
+print(p)
+```
+
+
+## SRP222833
+* Transcripts expression TPM
+```{r}
+write_xlsx(SRP222833_gene, "transcripts_expression_TPM.SRP222833.xlsx")
+    SRP222833_gene %>%
+        mutate_if(is.numeric, round, digits = 2) %>%
+        datatable(extensions = "Buttons", options = list(dom = "Blfrtip", buttons = c("csv",
+            "excel"), lengthMenu = list(c(10, 25, 50, -1), c(10, 25, 50, "All"))))
+```
+```{r, fig.width=14, fig.height=40}
+toplot_SRP222833 <- SRP222833_gene %>% gather("Sample", "TPM", -tx)
+
+p <- ggplot(toplot_SRP222833, aes(x = TPM, y = tx)) +
+  geom_col(aes(fill = tx)) +
+  facet_wrap(~Sample, ncol = 4) +
+  ggtitle("SRP222833") +
+  scale_y_discrete(limits = rev) +
+  # theme_classic() +
+  theme(plot.margin = margin(10, 10, 10, 10),
+      plot.title = element_text(hjust = 0.5),
+      axis.text = element_text(size = 10),
+      axis.text.x = element_text(size = 10,  hjust = 1),
+      axis.title = element_text(size = 12, face = "bold"),
+      legend.position = "right")
+print(p)
+```

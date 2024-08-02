@@ -1,0 +1,455 @@
+---
+title: "Ocular snRNAseq pilot_dataset1+dataset2"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: yes
+    code_folding: hide
+---
+
+# Abstract
+This is our pilot Ocualr Single nucleus RNAseq for Glaucoma disease.
+ 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE,
+                      warning = FALSE,
+                      comment = "")
+```
+
+```{r}
+library(biomaRt)
+library(Seurat)
+library(sctransform)
+library(glmGamPoi)
+library(tidyverse)
+library(reshape2)
+library(future)
+library(openxlsx)
+library(patchwork)
+library(HGNChelper)
+Sys.setenv(PROJ_LIB = "/home/ubuntu/anaconda3/envs/r4.2.1/share/proj")
+Sys.setenv(GDAL_DATA = "/home/ubuntu/anaconda3/envs/r4.2.1/share/gdal")
+source("/mnt/data/apps/sc-type/R/gene_sets_prepare.R")
+source("/mnt/data/apps/sc-type/R/sctype_score_.R")
+setwd('~/Ocular_snRNAseq_pilot_2nd')
+set.seed(123)
+```
+
+
+# Load and combine sample feature_bc_matrix from cellranger 
+```{r, eval = FALSE}
+# List all the files with ".rds$" and "_S" in their names
+rds_path1 <- list.files('../Ocular_snRNAseq_pilot/nf-core/output/cellranger/cellranger/mtx_conversions/',
+    pattern = "NHP_S_[1-4]_matrix\\.rds", full.names = TRUE)
+rds_names1 <-  gsub("_matrix.rds$", "", basename(rds_path1))
+rds_list1 <- lapply(rds_path1, readRDS)
+names(rds_list1) <- rds_names1
+
+# dataset2
+rds_path2 <- list.files('./nf-core/output/cellranger/cellranger/mtx_conversions/',
+    pattern = "DAPI_[1-3]_matrix\\.rds", full.names = TRUE)
+rds_names2 <-  gsub("_matrix.rds$", "", basename(rds_path2))
+rds_list2 <- lapply(rds_path2, readRDS)
+names(rds_list2) <- rds_names2
+
+rds_list <- c(rds_list1, rds_list2)
+
+# combine samples
+seuratObj <- merge(rds_list[[1]], y = rds_list[2:7], add.cell.ids = names(rds_list), project = "ocular_pilot")
+# add sample names
+cells <- rownames(seuratObj@meta.data)
+
+tmp <- sub("(NHP_S_[1-4]).*", "\\1", cells)
+seuratObj$sample <- sub("(DAPI_[1-4]).*", "\\1", tmp)
+
+#add groups
+dataset_info <- ifelse(grepl("NHP", seuratObj$sample), "dataset1", ifelse(grepl("DAPI", seuratObj$sample), "dataset2", "unknown"))
+seuratObj <- AddMetaData(seuratObj, metadata = dataset_info, col.name = "dataset")
+
+```
+
+# QC and selecting cells for further analysis
+
+## Add %mitochondrial counts and cell cycle scores 
+```{r, eval = FALSE}
+## mitochondrial genes:
+mt_genes <- c("ND1", "ND2", "COX1", "COX2", "ATP8", "ATP6", "COX3", "ND3", "ND4L", "ND4", "ND5", "ND6", "CYTB")
+
+seuratObj[["percent.mt"]] <- PercentageFeatureSet(seuratObj, features = mt_genes)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+seuratObj <- CellCycleScoring(seuratObj, s.features = s.genes, g2m.features = g2m.genes)
+```
+
+## QC
+- Filter cells by:  
+1, umi/nCount_RNA, low-quality cells (very low UMI counts) or doublets (very high UMI counts)  
+2, gene/nFeature_RNA, remove potential low-quality cells and multiplets as above  
+3, percent.mt, note that this step directly removes cells with high mt, the regress.out function later   
+removes variations from mt and cell-cyle gene expression.   
+4, our cutoff is chosen by visulizing data in Loupe browser    
+
+== Load filtered Seurat obj instead of re-run the following steps 
+```{r}
+seuratObj <- readRDS("ocular_obj.rds")
+```
+
+- The object after pre-process
+```{r}
+seuratObj
+table(seuratObj[[]]$sample)
+table(seuratObj[[]]$dataset)
+head(seuratObj, 5)
+```
+
+### QC stats
+```{r}
+summary(seuratObj$nCount_RNA)
+summary(seuratObj$nFeature_RNA)
+summary(seuratObj$percent.mt)
+```
+
+UMI range is (`r min(seuratObj$nCount_RNA)`, `r max(seuratObj$nCount_RNA)`)
+nfeatue range is (`r min(seuratObj$nFeature_RNA)`, `r max(seuratObj$nFeature_RNA)`)
+
+Retinal ganglion cells are larger, results in a greater amount of total RNA per cell. 
+Skip the nCount_RNA and nFeature_RNA filter as the gRed team did in their 2023 Cell Genomics paper.
+
+Only remove cells with >5% mitochondrial expressions: `r length(seuratObj$percent.mt[seuratObj$percent.mt>5])`
+
+```{r, eval = FALSE}
+seuratObj <- subset(seuratObj, subset = percent.mt < 5)
+```
+
+### QC metrics as a violin plot 
+- by initial clusters
+```{r, fig.height=10, fig.width=12}
+VlnPlot(seuratObj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), pt.size = 0, ncol = 1)
+```
+
+- by samples
+```{r, fig.height=6, fig.width=12}
+VlnPlot(seuratObj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+    group.by = 'sample',
+    pt.size = 0.2, ncol = 3)
+```
+
+
+## SCTransform normalization, PCA and Clustering 
+```{r, eval = FALSE}
+# regressing out unwanted variation (mitochondrial, cell cyle, etc.)
+seuratObj <- SCTransform(seuratObj, method = "glmGamPoi", vst.flavor = "v2",
+        vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"), verbose = TRUE)
+
+seuratObj <- RunPCA(seuratObj, npcs = 30)
+# ElbowPlot(seuratObj, ndims = 30)
+seuratObj <- RunUMAP(seuratObj, reduction = "pca", dims = 1:30)
+seuratObj <- FindNeighbors(seuratObj, reduction = "pca", dims = 1:30)
+seuratObj <- FindClusters(seuratObj, resolution = 0.3)
+```
+
+== Save processed object
+```{r, eval = FALSE}
+saveRDS(seuratObj, file = "ocular_obj.rds")
+```
+
+## Visualize initial clusters
+```{r, fig.height=7, fig.width=14}
+p1 <- DimPlot(seuratObj, reduction = "umap", group.by = "sample") + theme(legend.position = "top")
+p2 <- DimPlot(seuratObj, reduction = "umap", label = TRUE, repel = TRUE) + NoLegend()
+p1 + p2
+```
+
+```{r, fig.height=10, fig.width=14}
+DimPlot(seuratObj, reduction = "umap", label = FALSE, split.by = "sample", ncol = 4) + theme(legend.position = "top")
+```
+
+## Number of cells in each cluster
+```{r}
+plot_clusters <- function(srat) {
+    count_table <- table(srat@meta.data$seurat_clusters, srat@meta.data$sample)
+    count_mtx <- as.data.frame.matrix(count_table)
+    count_mtx$clusters <- rownames(count_mtx)
+    melt_mtx <- melt(count_mtx)
+
+    celltype_size <- aggregate(value ~ clusters, data = melt_mtx, FUN = sum)
+    celltype_size <- celltype_size %>% dplyr::arrange(value)
+    celltype_size$clusters <- factor(celltype_size$clusters, levels = celltype_size$clusters)
+    melt_mtx$clusters <- factor(melt_mtx$clusters, levels = celltype_size$clusters)
+    colnames(melt_mtx)[2] <- "sample"
+
+    p1 <- ggplot(celltype_size, aes(y = clusters, x = value)) +
+    geom_bar(position = "dodge", stat = "identity", fill = "grey60") +
+    theme_bw() + scale_x_log10() + xlab("Cells per cluster, log10 scale") + ylab("")
+
+    p2 <- ggplot(melt_mtx, aes(x = clusters, y = value, fill = sample)) +
+        geom_bar(position = "fill", stat = "identity") + theme_bw() + coord_flip() +
+        scale_fill_brewer(palette = "Set2") +
+        ylab("Fraction of cells in each sample") + xlab("cluster number") + theme(legend.position = "top")
+
+    p2 + p1 + plot_layout(widths = c(3, 1))
+}
+```
+```{r fig.height=8, fig.width=14}
+plot_clusters(seuratObj)
+```
+
+# Data Integration  
+To identify cell types present in all samples/conditions/modalities within our dataset,  
+and would like to observe a representation of cells from both samples/conditions/modalities in every cluster.  
+Reference: https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/06_integration.md  
+- Execute the normalization, variance estimation, and identification of the most variable genes for each sample   
+- Perform integration of cells across conditions using the most variant genes to identify cells most similar to each other  
+
+== Load object list `seuratObj.list`
+```{r, eval = FALSE}
+seuratObj.list <- readRDS("ocular_obj.list.rds")
+```
+
+== Load objects `ocular_obj.integrated`
+```{r}
+seuratObj.integrated <- readRDS("ocular_obj.integrated.rds")
+table(seuratObj.integrated$seurat_clusters)
+```
+
+## Split object and SCTransform normalization  
+split the dataset into a list of two seurat objects (GLA_KO and WT), 
+normalize and identify variable features for each dataset independently.  
+```{r, eval = FALSE}
+seuratObj.list <- SplitObject(seuratObj, split.by = "sample")
+
+for (i in 1:length(seuratObj.list)) {
+    seuratObj.list[[i]] <- SCTransform(seuratObj.list[[i]], method = "glmGamPoi", vst.flavor = "v2",
+        vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"), verbose = TRUE) %>%
+    RunPCA(npcs = 30)
+}
+```
+
+## Select features and prepare integration 
+Select features that are repeatedly variable across datasets for integration, 
+and run `PrepSCTIntegration`, which ensures that all necessary Pearson residuals have been calculated.  
+```{r, eval = FALSE}
+seuratObj.features <- SelectIntegrationFeatures(object.list = seuratObj.list, nfeatures = 3000)
+seuratObj.list <- PrepSCTIntegration(object.list = seuratObj.list, anchor.features = seuratObj.features)
+```
+
+== Save object `seuratObj.list`
+```{r, eval = FALSE}
+saveRDS(seuratObj.list, file = "ocular_obj.list.rds")
+```
+
+## Identify anchors and integrate the datasets
+### using the 2nd dataset as references (samples 5-7) 
+When using a set of specified references, anchors are first found between each query and each reference. 
+The references are then integrated through pairwise integration. Each query is then mapped to the integrated reference.
+Make sure to set normalization.method = **"SCT"**, and reduction = **"rpca"** for reciprocal PCA  
+```{r, eval = FALSE}
+anchors <- FindIntegrationAnchors(object.list = seuratObj.list, normalization.method = "SCT",
+    reference = c(5, 6, 7),
+    anchor.features = seuratObj.features, reduction = "rpca")
+seuratObj.integrated <- IntegrateData(anchorset = anchors, normalization.method = "SCT")
+```
+
+
+# Cluster on the integrated dataset
+## PCA and Clustering  
+```{r, eval = FALSE}
+DefaultAssay(seuratObj.integrated) <- "integrated"
+seuratObj.integrated <- RunPCA(seuratObj.integrated, npcs = 30)
+# ElbowPlot(seuratObj.integrated, ndims = 30)
+
+seuratObj.integrated <- RunUMAP(seuratObj.integrated, reduction = "pca", dims = 1:30)
+seuratObj.integrated <- FindNeighbors(seuratObj.integrated, reduction = "pca", dims = 1:30)
+# try 0.3-0.5, give 26, 28, 30 clusters
+seuratObj.integrated <- FindClusters(seuratObj.integrated, resolution = 0.3)
+table(seuratObj.integrated$seurat_clusters)
+```
+
+== Save integrated object
+```{r, eval = FALSE}
+saveRDS(seuratObj.integrated, file = "ocular_obj.integrated.rds")
+```
+
+## Plots after integration   
+```{r, fig.height=7, fig.width=14}
+p1 <- DimPlot(seuratObj.integrated, reduction = "umap", group.by = "sample") + theme(legend.position = "top")
+p2 <- DimPlot(seuratObj.integrated, reduction = "umap", label = TRUE, repel = TRUE) + NoLegend()
+p1 + p2
+```
+
+```{r, fig.height=10, fig.width=14}
+DimPlot(seuratObj.integrated, reduction = "umap", label = FALSE, split.by = "sample", ncol = 4) + theme(legend.position = "top")
+```
+
+## Number of cells in each cluster
+```{r}
+plot_integrated_clusters <- function(srat) { 
+    count_table <- table(srat@meta.data$seurat_clusters, srat@meta.data$sample)
+    count_mtx <- as.data.frame.matrix(count_table)
+    count_mtx$clusters <- rownames(count_mtx)
+    melt_mtx <- melt(count_mtx)
+
+    celltype_size <- aggregate(value ~ clusters, data = melt_mtx, FUN = sum)
+    celltype_size <- celltype_size %>% dplyr::arrange(value)
+    celltype_size$clusters <- factor(celltype_size$clusters, levels = celltype_size$clusters)
+    melt_mtx$clusters <- factor(melt_mtx$clusters, levels = celltype_size$clusters)
+    colnames(melt_mtx)[2] <- "sample"
+
+    p1 <- ggplot(celltype_size, aes(y = clusters, x = value)) +
+    geom_bar(position = "dodge", stat = "identity", fill = "grey60") +
+    theme_bw() + scale_x_log10() + xlab("Cells per cluster, log10 scale") + ylab("")
+
+    p2 <- ggplot(melt_mtx, aes(x = clusters, y = value, fill = sample)) +
+        geom_bar(position = "fill", stat = "identity") + theme_bw() + coord_flip() +
+        scale_fill_brewer(palette = "Set2") +
+        ylab("Fraction of cells in each sample") + xlab("cluster number") + theme(legend.position = "top")
+
+    p2 + p1 + plot_layout(widths = c(3, 1))
+}
+```
+```{r fig.height=8, fig.width=14}
+plot_integrated_clusters(seuratObj.integrated)
+```
+
+
+# Cell type annotation
+
+## Apply marker based tool `sc-type`
+```{r}
+# prepare marker genes from the database, category: Immune system, Liver, Pancreas, Kidney, Eye, Brain
+# gs_list <- gene_sets_prepare("/mnt/data/apps/sc-type/ScTypeDB_short.xlsx", "Eye")
+
+# use a customized marker list
+gs_list <- gene_sets_prepare("ocular_customized_markers.xlsx", "Eye")
+# get cell-type by cell matrix
+# NOTE: scRNAseqData parameter should correspond to your input scRNA-seq matrix.
+# In case Seurat is used, it is either pbmc[["RNA"]]@scale.data (default),
+# pbmc[["SCT"]]@scale.data, in case sctransform is used for normalization,
+# or pbmc[["integrated"]]@scale.data, in case a joint analysis of multiple single-cell datasets is performed.
+es.max <- sctype_score(scRNAseqData = seuratObj.integrated[['integrated']]@scale.data, scaled = TRUE,
+                      gs = gs_list$gs_positive, gs2 = gs_list$gs_negative)
+
+# merge by cluster
+metadata <- seuratObj.integrated@meta.data
+clusters <- unique(seuratObj.integrated@meta.data$seurat_clusters)
+cL_resutls <- do.call("rbind",
+    lapply(
+        clusters,
+        function(cl) {
+            es.max.cl <- sort(rowSums(es.max[, rownames(metadata[metadata$seurat_clusters == cl, ])]),
+                decreasing = TRUE)
+            cell_scores <- data.frame(cluster = cl,
+                    type = names(es.max.cl),
+                    scores = es.max.cl,
+                    ncells = sum(metadata$seurat_clusters == cl))
+            head(cell_scores, 10)
+        }
+    )
+)
+sctype_scores <- cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)
+
+# set low-confident (low ScType score) clusters to "unknown"
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] <- "Unknown"
+data.frame(sctype_scores)
+
+# add cell type annotations to obj
+seuratObj.integrated@meta.data$celltypes <- ""
+for (j in unique(sctype_scores$cluster)){
+  cl_type <- sctype_scores[sctype_scores$cluster == j, ]
+  seuratObj.integrated@meta.data$celltypes[seuratObj.integrated@meta.data$seurat_clusters == j] <-
+    as.character(cl_type$type[1])
+}
+```
+
+
+## Show cell types on UMAP
+```{r, fig.height=14, fig.width=14}
+DimPlot(seuratObj.integrated, reduction = "umap", label = TRUE, repel = TRUE,
+    group.by = 'celltypes') +
+    theme(legend.position = "top")
+```
+
+```{r, fig.height=14, fig.width=14}
+DimPlot(seuratObj.integrated, reduction = "umap", label = TRUE, repel = TRUE, split.by = 'sample', ncol = 4,
+    group.by = 'celltypes') +
+    theme(legend.position = "top")
+```
+
+## Number of cells in each cell type
+```{r}
+plot_celltypes <- function(srat) {
+    count_table <- table(srat@meta.data$celltypes, srat@meta.data$sample)
+    count_mtx <- as.data.frame.matrix(count_table)
+    count_mtx$celltypes <- rownames(count_mtx)
+    melt_mtx <- melt(count_mtx)
+
+    celltype_size <- aggregate(value ~ celltypes, data = melt_mtx, FUN = sum)
+    celltype_size <- celltype_size %>% dplyr::arrange(value)
+    celltype_size$celltypes <- factor(celltype_size$celltypes, levels = celltype_size$celltypes)
+    melt_mtx$celltypes <- factor(melt_mtx$celltypes, levels = celltype_size$celltypes)
+    colnames(melt_mtx)[2] <- "sample"
+
+    p1 <- ggplot(celltype_size, aes(y = celltypes, x = value)) +
+    geom_bar(position = "dodge", stat = "identity", fill = "grey60") +
+    theme_bw() + scale_x_log10() + xlab("Cells per celltype, log10 scale") + ylab("")
+
+    p2 <- ggplot(melt_mtx, aes(x = celltypes, y = value, fill = sample)) +
+        geom_bar(position = "fill", stat = "identity") + theme_bw() + coord_flip() +
+        scale_fill_brewer(palette = "Set2") +
+        ylab("Fraction of cells in each sample") + xlab("celltype number") + theme(legend.position = "top")
+
+    p2 + p1 + plot_layout(widths = c(3, 1))
+}
+```
+
+```{r fig.height=6, fig.width=14}
+plot_celltypes(seuratObj.integrated)
+```
+
+
+
+# Cluster markers analysis
+== Load all cluster markers obj
+```{r}
+all.markers <- readRDS("all.cluster_markers.rds")
+head(all.markers)
+```
+
+## Find all markers
+```{r, eval = FALSE}
+seuratObj.integrated <- PrepSCTFindMarkers(seuratObj.integrated, assay = "SCT", verbose = TRUE)
+# plan(multicore)
+all.markers <- FindAllMarkers(seuratObj.integrated, assay = "SCT", verbose = TRUE)
+# plan(sequential)
+```
+
+## Save marker genes
+```{r, eval = FALSE}
+all.markers <- all.markers %>% relocate(gene)
+write_tsv(all.markers, "all.cluster_markers.tsv")
+top20 <- all.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 25, wt = avg_log2FC)
+write_tsv(top20, "top25.cluster_markers.tsv")
+saveRDS(all.markers, file = "all.cluster_markers.rds")
+```
+
+## Heatmap with top genes {.tabset}
+
+### Markers for each Cluster
+- showing expression in 10% random cells for each cluster  
+```{r, fig.height=20, fig.width=12}
+Idents(seuratObj.integrated) <- "seurat_clusters"
+
+top10 <- all.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC)
+
+DoHeatmap(subset(seuratObj.integrated, downsample = 100), features = top10$gene, size = 3) +
+    theme(legend.position = 'none', plot.margin = margin(t = 20))
+```

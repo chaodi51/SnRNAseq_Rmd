@@ -1,0 +1,226 @@
+---
+title: "Differential expression between ARPE-19 cell line and differentiated iCELL RPE"
+author: "Chao Di, chao.di@sparktx.com"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: yes
+    code_folding: hide
+---
+# Abstract
+This project is for dissecting the transcriptome changes between ARPE-19 cell line and differentiated iCELL RPE at day 70.
+Raw data was processed using nf-core rnaseq pipeline. `DESeq2` is used for the analysis.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE,
+                      warning = FALSE,
+                      tidy = TRUE)
+```
+
+```{r include=FALSE}
+library(tidyverse)
+library(DESeq2)
+library(pheatmap)
+library(reshape2)
+library(biomaRt)
+library(writexl)
+library(DT)
+library(data.table)
+library(httpgd)
+library(ggpubr)
+library(GSVA)
+library(VennDiagram)
+setwd("~/Ocular_RNAseq_ARPE-dRPE")
+```
+
+
+# Load data
+load data from output of nf-core/differentialabundance pipeline.
+```{r}
+
+# raw count normalization, as gene expression values
+norm_counts <- read.csv("output_diff/tables/processed_abundance/all.normalised_counts.tsv", sep = "\t")
+
+# count transformation, log2 scale, either rlog or vst, used for distance related analysis
+transform_counts <- read.csv("output_diff/tables/processed_abundance/all.vst.tsv", sep = "\t")
+
+meta_data <- read.csv("samplesheet_local.csv")
+row.names(meta_data) <- meta_data$sample
+meta_data$replicate <- as.factor(meta_data$replicate)
+
+RPE_sigGene <- read.table("RPE_signature_genes.txt", header = FALSE)
+``` 
+
+Add Ensembl gene names
+```{r}
+mart <- useMart("ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl")
+tr <- getBM(attributes = c("hgnc_symbol", "ensembl_gene_id"),
+                  filters = "ensembl_gene_id", values = norm_counts$gene_id,
+                  mart = mart)
+tr_uni <- tr %>% group_by(hgnc_symbol) %>% filter(row_number() == 1) %>% as.data.frame()
+colnames(tr_uni) <- c("gene_name", "gene_id")
+
+norm_counts <- left_join(norm_counts, tr_uni, by = "gene_id")
+# remove one redundant gene name
+norm_counts <- norm_counts %>% filter(gene_name != 'LINC00856')
+rownames(norm_counts) <- norm_counts$gene_name
+
+transform_counts <- left_join(transform_counts, tr_uni, by = "gene_id")
+# remove one redundant gene name
+transform_counts <- transform_counts %>% filter(gene_name != 'LINC00856')
+rownames(transform_counts) <- transform_counts$gene_name
+
+```
+
+Calculate gene signature score
+```{r}
+expression_data <- transform_counts %>% dplyr::select(!c(gene_id, gene_name))
+ssgsea_scores <- gsva(
+  as.matrix(expression_data),
+  list(RPE_sig = as.vector(RPE_sigGene$V1)),
+  method = "ssgsea",
+  verbose = FALSE
+)
+
+```
+
+# Analysis for 154 RPE genes
+## Heatmap
+```{r fig.height=12, fig.width=7}
+pdata <- transform_counts %>% dplyr::filter(rownames(transform_counts) %in% as.vector(RPE_sigGene$V1)) %>% dplyr::select(!c(gene_id, gene_name))
+
+df <- as.data.frame(meta_data)[, c("condition", "replicate")]
+
+pheatmap(pdata, cluster_rows = TRUE, show_rownames = TRUE, fontsize_row = 5,
+         cluster_cols = TRUE, annotation_col = df, angle_col = "315")
+```
+
+## Boxplot
+### RPE gene expression
+```{r fig.height=5, fig.width=4}
+df_long <- gather(pdata, key = "Sample", value = "Expression")
+
+df_long$condition <- ifelse(grepl("GTSAMPLE051[2-4]", df_long$Sample), "ARPE-19", "iCell-RPE")
+
+ggplot(df_long, aes(x = condition, y = Expression, fill = condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.75) +
+  geom_jitter(position = position_jitter(0.1), shape = 21, colour = "black", size = 1, alpha = 0.8) +
+  scale_fill_manual(values = c("#ffa600d2", "#0057ed")) +
+  theme_minimal() +
+  labs(title = "Gene Expression by cell types",
+        x = "",
+        y = "log2(TPM)") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_blank()) +
+  # stat_compare_means(aes(group = condition), label = "p.signif", method = "wilcox.test") +
+  geom_signif(comparisons = list(c("ARPE-19", "iCell-RPE")), map_signif_level = TRUE, test = "t.test")
+```
+
+### RPE signature score calculated by ssGSEA
+```{r fig.height=5, fig.width=4}
+df_long <- gather(as.data.frame(ssgsea_scores), key = "Sample", value = "Signature Score")
+
+df_long$condition <- ifelse(grepl("GTSAMPLE051[2-4]", df_long$Sample), "ARPE-19", "iCell-RPE")
+
+ggplot(df_long, aes(x = condition, y = `Signature Score`, fill = condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.75) +
+  geom_jitter(position = position_jitter(0.1), shape = 21, colour = "black", size = 1, alpha = 0.8) +
+  scale_fill_manual(values = c("#ffa600d2", "#0057ed")) +
+  theme_minimal() +
+  labs(title = "RPE 154",
+        x = "",
+        y = "gene signature score (ssGSEA)") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_blank()) +
+  # stat_compare_means(aes(group = condition), label = "p.signif", method = "wilcox.test") +
+  geom_signif(comparisons = list(c("ARPE-19", "iCell-RPE")), map_signif_level = TRUE, test = "t.test")
+```
+
+### marker gene expression comparison
+```{r fig.height=6, fig.width=6}
+
+marker_Exp <- expression_data %>% filter(rownames(expression_data) %in% c('BEST1','RPE65', 'RLBP1'))
+marker_Exp <- rownames_to_column(marker_Exp, var = "gene")
+df_long <- pivot_longer(
+  data = marker_Exp,
+  cols = -gene,
+  names_to = "sample",
+  values_to = "expression"
+)
+
+df_long$condition <- ifelse(grepl("GTSAMPLE051[2-4]", df_long$sample), "ARPE-19", "iCell-RPE")
+
+ggplot(df_long, aes(x = condition, y = expression, fill = condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.75) +
+  geom_jitter(position = position_jitter(0.1), shape = 21, colour = "black", size = 1, alpha = 0.8) +
+  scale_fill_manual(values = c("#ffa600d2", "#0057ed")) +
+  theme_minimal() +
+  facet_wrap(~ gene) + 
+  labs(title = "Marker gene expression",
+        x = "",
+        y = "log2(TPM)") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_blank()) +
+  geom_signif(comparisons = list(c("ARPE-19", "iCell-RPE")), map_signif_level = TRUE, test = "t.test")
+```
+
+# Analysis for [retinal disease genes](https://web.sph.uth.edu/RetNet/sym-dis.htm?csrt=1629203465032406989)
+```{r}
+retina_disease_genes <- read.table("retina_disease_genes_RetNet.txt", header = TRUE)
+
+```
+
+## Heatmap
+```{r fig.height=20, fig.width=7}
+## different names in the list which correspond to the same genes
+pdata <- transform_counts %>% dplyr::filter(rownames(transform_counts) %in% as.vector(retina_disease_genes$Symbol)) %>% dplyr::select(!c(gene_id, gene_name))
+
+df <- as.data.frame(meta_data)[, c("condition", "replicate")]
+
+pheatmap(pdata, cluster_rows = TRUE, show_rownames = TRUE, fontsize_row = 5,
+        cluster_cols = TRUE, annotation_col = df, angle_col = "315")
+```
+
+## Expression comparison
+```{r}
+pdata <- norm_counts %>% dplyr::filter(rownames(norm_counts) %in% as.vector(retina_disease_genes$Symbol)) %>% dplyr::select(!c(gene_id, gene_name))
+
+
+ARPE_19 <- pdata[, 1:3]
+iCell_RPE <- pdata[, 4:6]
+
+expressed_ARPE_19 <- rownames(ARPE_19)[apply(ARPE_19, 1, function(x) all(x > 0))]
+expressed_iCell_RPE <- rownames(iCell_RPE)[apply(iCell_RPE, 1, function(x) all(x > 0))]
+```
+
+
+```{r}
+# Creating a Venn diagram
+
+# Now draw the Venn diagram again
+venn.plot <- draw.pairwise.venn(
+  area1 = length(expressed_ARPE_19),
+  area2 = length(expressed_iCell_RPE),
+  cross.area = length(intersect(expressed_ARPE_19, expressed_iCell_RPE)),
+  category = c("ARPE_19", "iCell_RPE"),
+  fill = c("#4f71d7", "#e36767d8"),
+  label.col = "#100e0e",
+  cex = 2,
+  cat.cex = 1,
+  cat.col = c("blue", "red"),
+  lwd = 2,
+  lty = 'blank',
+  cat.pos = c(300, 120),
+  cat.dist = 0.01
+)
+
+```
+
+**Expressed only in ARPE_19**
+```{r}
+setdiff(expressed_ARPE_19, expressed_iCell_RPE)
+```
+**Expressed only in iCell_RPE**
+```{r}
+setdiff(expressed_iCell_RPE, expressed_ARPE_19)
+```

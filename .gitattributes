@@ -1,0 +1,7 @@
+# Treat RMarkdown files as R scripts
+*.rmd linguist-language=R
+
+# Exclude certain files from being counted
+*.md linguist-documentation
+*.html linguist-generated
+*.csv linguist-generated

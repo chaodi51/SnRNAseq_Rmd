@@ -1,0 +1,798 @@
+---
+title: "Ocular_snRNAseq_NEFH-CAG_GFPplus_twoNewMacula"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: yes
+    code_folding: hide
+---
+
+# Abstract
+Integrated data from the two new samples (GTSAMPLE2045/CAG and GTSAMPLE2046/NEFH) with promoter identity in meta data set to NEFH and CAG for comparisons.  
+Use GFP sequence plus 194nt before polyA.  
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE,
+                      warning = FALSE,
+                      comment = "")
+```
+
+```{r}
+library(biomaRt)
+library(Seurat)
+library(randomcoloR)
+library(scCustomize)
+library(sctransform)
+library(glmGamPoi)
+library(tidyverse)
+# library(corrplot)
+library(reshape2)
+library(future)
+options(future.globals.maxSize = 800 * 1024^2) # tested, use 600M
+library(openxlsx)
+library(patchwork)
+library(HGNChelper)
+library(httpgd)
+library(Scillus)
+library(fgsea)
+library(msigdbr)
+library(qs)
+Sys.setenv(PROJ_LIB = "/home/ubuntu/anaconda3/envs/r4.2.1/share/proj")
+Sys.setenv(GDAL_DATA = "/home/ubuntu/anaconda3/envs/r4.2.1/share/gdal")
+source("/mnt/data/apps/sc-type/R/gene_sets_prepare.R")
+source("/mnt/data/apps/sc-type/R/sctype_score_.R")
+setwd('~/Ocular_snRNAseq_NEFH-CAG_GFPplus_twoNewMacula/')
+set.seed(123)
+```
+
+
+# Load and combine sample feature_bc_matrix from cellranger 
+```{r, eval = FALSE}
+# two promoter NEFH and CAG
+rds_path <- list.files('./nf-core/output/cellranger/cellranger/mtx_conversions/',
+    pattern = "_matrix\\.rds", full.names = TRUE)
+rds_names <-  gsub("_matrix.rds$", "", basename(rds_path))
+rds_list <- lapply(rds_path, readRDS)
+names(rds_list) <- rds_names
+
+
+# combine samples
+seuratObj <- merge(rds_list[[1]], y = rds_list[2:15], add.cell.ids = names(rds_list), project = "Ocular_NEFH_vs_CAG")
+
+# add sample names
+cells <- rownames(seuratObj@meta.data)
+
+# extract sample ids
+seuratObj$sample <- sub("_[^_]*$", "", cells)
+
+# add groups
+group <- ifelse(grepl('GTSAMPLE2045', seuratObj$sample), "CAG", "NEFH")
+seuratObj <- AddMetaData(seuratObj, metadata = group, col.name = "group")
+
+sample = unique(seuratObj$sample)
+
+```
+
+# QC and selecting cells for further analysis
+
+## Add %mitochondrial counts and cell cycle scores 
+```{r, eval = FALSE}
+
+## mitochondrial genes:
+mt_genes <- c("ND1", "ND2", "COX1", "COX2", "ATP8", "ATP6", "COX3", "ND3", "ND4L", "ND4", "ND5", "ND6", "CYTB")
+
+seuratObj[["percent.mt"]] <- PercentageFeatureSet(seuratObj, features = mt_genes)
+
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+seuratObj <- CellCycleScoring(seuratObj, s.features = s.genes, g2m.features = g2m.genes)
+```
+
+## QC
+- Filter cells by:  
+1, umi/nCount_RNA, low-quality cells (very low UMI counts) or doublets (very high UMI counts)  
+2, gene/nFeature_RNA, remove potential low-quality cells and multiplets as above  
+3, percent.mt, note that this step directly removes cells with high mt, the regress.out function later   
+removes variations from mt and cell-cyle gene expression.   
+4, our cutoff is chosen by visulizing data in Loupe browser    
+5
+== Load filtered Seurat obj instead of re-run the following steps 
+```{r}
+seuratObj <- qread("ocular_obj.qs")
+# seuratObj <- readRDS("ocular_obj.rds")
+```
+
+- The object after pre-process
+```{r}
+seuratObj
+table(seuratObj[[]]$sample)
+head(seuratObj, 5)
+```
+
+### QC stats
+```{r}
+summary(seuratObj$nCount_RNA)
+summary(seuratObj$nFeature_RNA)
+summary(seuratObj$percent.mt)
+```
+
+UMI range is (`r min(seuratObj$nCount_RNA)`, `r max(seuratObj$nCount_RNA)`)
+nfeatue range is (`r min(seuratObj$nFeature_RNA)`, `r max(seuratObj$nFeature_RNA)`)
+
+Retinal ganglion cells are larger, results in a greater amount of total RNA per cell. 
+Skip the nCount_RNA and nFeature_RNA filter as the gRed team did in their 2023 Cell Genomics paper.
+
+Only remove cells with >5% mitochondrial expressions: `r length(seuratObj$percent.mt[seuratObj$percent.mt > 5])`
+
+```{r, eval = FALSE}
+seuratObj <- subset(seuratObj, subset = percent.mt < 5 &
+    nFeature_RNA > 100 &
+    nCount_RNA > 200)
+```
+
+### QC metrics as a violin plot 
+- by initial clusters
+```{r, fig.height=10, fig.width=12}
+VlnPlot(seuratObj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), pt.size = 0, ncol = 3)
+```
+
+- by samples
+```{r, fig.height=6, fig.width=12}
+VlnPlot(seuratObj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+    group.by = 'sample',
+    pt.size = 0.2, ncol = 3)
+```
+
+== Save processed object
+```{r, eval = FALSE}
+qsave(seuratObj, file = "ocular_obj.qs")
+# saveRDS(seuratObj, file = "ocular_obj.rds")
+```
+
+# Data Integration  
+To identify cell types present in all samples/conditions/modalities within our dataset,  
+and would like to observe a representation of cells from both samples/conditions/modalities in every cluster.  
+Reference: https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/06_integration.md  
+- Execute the normalization, variance estimation, and identification of the most variable genes for each sample   
+- Perform integration of cells across conditions using the most variant genes to identify cells most similar to each other  
+
+== Load object list `seuratObj.list`
+```{r, eval = FALSE}
+seuratObj.list <- qread("ocular_obj.list.qs")
+# seuratObj.list <- readRDS("ocular_obj.list.rds")
+```
+
+== Load objects `ocular_obj.integrated`
+```{r}
+seuratObj.integrated <- qread("ocular_obj.integrated.qs")
+# seuratObj.integrated <- readRDS("ocular_obj.integrated.rds")
+table(seuratObj.integrated$seurat_clusters)
+```
+
+## Split object and SCTransform normalization  
+split the dataset by samples into a list of seurat objects,
+normalize and identify variable features for each dataset independently.  
+```{r, eval = FALSE}
+seuratObj.list <- SplitObject(seuratObj, split.by = "sample")
+
+for (i in 1:length(seuratObj.list)) {
+    seuratObj.list[[i]] <- SCTransform(seuratObj.list[[i]], method = "glmGamPoi", vst.flavor = "v2",
+        vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"), verbose = TRUE) %>%
+    RunPCA(npcs = 30)
+}
+```
+
+## Select features and prepare integration 
+Select features that are repeatedly variable across datasets for integration, 
+and run `PrepSCTIntegration`, which ensures that all necessary Pearson residuals have been calculated.  
+```{r, eval = FALSE}
+RGC_markers <- c('ENSMFAG00000036911','SYT2','SLC17A6','SNCG')
+seuratObj.features <- SelectIntegrationFeatures(object.list = seuratObj.list, nfeatures = 3000)
+seuratObj.features <- unique(c(seuratObj.features, RGC_markers))
+seuratObj.list <- PrepSCTIntegration(object.list = seuratObj.list, anchor.features = seuratObj.features)
+```
+
+== Save object `seuratObj.list`
+```{r, eval = FALSE}
+qsave(seuratObj.list, file = "ocular_obj.list.qs")
+# saveRDS(seuratObj.list, file = "ocular_obj.list.rds")
+```
+
+## Identify anchors and integrate the datasets
+### using the samples with high RGCs as references (periphery samples here)
+When using a set of specified references, anchors are first found between each query and each reference. 
+The references are then integrated through pairwise integration. Each query is then mapped to the integrated reference.
+Make sure to set normalization.method = **"SCT"**, and reduction = **"rpca"** for reciprocal PCA  
+```{r, eval = FALSE}
+anchors <- FindIntegrationAnchors(object.list = seuratObj.list, normalization.method = "SCT",
+    reference = seq(1,7),
+    anchor.features = seuratObj.features, reduction = "rpca")
+seuratObj.integrated <- IntegrateData(anchorset = anchors, normalization.method = "SCT")
+```
+
+
+# Cluster on the integrated dataset
+## PCA and Clustering  
+```{r, eval = FALSE}
+DefaultAssay(seuratObj.integrated) <- "integrated"
+seuratObj.integrated <- RunPCA(seuratObj.integrated, npcs = 30)
+# ElbowPlot(seuratObj.integrated, ndims = 30)
+
+seuratObj.integrated <- RunUMAP(seuratObj.integrated, reduction = "pca", dims = 1:30)
+seuratObj.integrated <- FindNeighbors(seuratObj.integrated, reduction = "pca", dims = 1:30)
+# try 0.3-0.5, give 26, 28, 30 clusters
+seuratObj.integrated <- FindClusters(seuratObj.integrated, resolution = 0.05)
+table(seuratObj.integrated$seurat_clusters)
+```
+
+== Save integrated object
+```{r, eval = FALSE}
+qsave(seuratObj.integrated, file = "ocular_obj.integrated.qs")
+# saveRDS(seuratObj.integrated, file = "ocular_obj.integrated.rds")
+```
+
+## Plots after integration   
+```{r, fig.height=7, fig.width=14}
+p1 <- DimPlot(seuratObj.integrated, reduction = "umap", group.by = "group") + theme(legend.position = "top")
+p2 <- DimPlot(seuratObj.integrated, reduction = "umap", label = TRUE, repel = TRUE) + NoLegend()
+p1 + p2
+```
+
+```{r, fig.height=18, fig.width=18}
+DimPlot(seuratObj.integrated, reduction = "umap", label = FALSE, split.by = "sample", ncol = 4) + theme(legend.position = "top")
+```
+
+```{r, fig.height=10, fig.width=14}
+DimPlot(seuratObj.integrated, reduction = "umap", label = FALSE, split.by = "group", ncol = 3) + theme(legend.position = "top")
+```
+
+## Number of cells in each cluster
+```{r}
+plot_integrated_clusters <- function(srat) { 
+    count_table <- table(srat@meta.data$seurat_clusters, srat@meta.data$sample)
+    count_mtx <- as.data.frame.matrix(count_table)
+    count_mtx$clusters <- rownames(count_mtx)
+    melt_mtx <- melt(count_mtx)
+
+    celltype_size <- aggregate(value ~ clusters, data = melt_mtx, FUN = sum)
+    celltype_size <- celltype_size %>% dplyr::arrange(value)
+    celltype_size$clusters <- factor(celltype_size$clusters, levels = celltype_size$clusters)
+    melt_mtx$clusters <- factor(melt_mtx$clusters, levels = celltype_size$clusters)
+    colnames(melt_mtx)[2] <- "sample"
+
+    p1 <- ggplot(celltype_size, aes(y = clusters, x = value)) +
+    geom_bar(position = "dodge", stat = "identity", fill = "grey60") +
+    theme_bw() + scale_x_log10() + xlab("Cells per cluster, log10 scale") + ylab("")
+
+    p2 <- ggplot(melt_mtx, aes(x = clusters, y = value, fill = sample)) +
+        geom_bar(position = "fill", stat = "identity") + theme_bw() + coord_flip() +
+        scale_fill_manual(values=as.vector(distinctColorPalette(24))) +
+        ylab("Fraction of cells in each sample") + xlab("cluster number") + theme(legend.position = "top")
+
+    p2 + p1 + plot_layout(widths = c(3, 1))
+}
+```
+```{r fig.height=8, fig.width=14}
+plot_integrated_clusters(seuratObj.integrated)
+```
+
+
+# Cell type annotation
+
+## Apply marker based tool `sc-type`
+```{r}
+sctype <- function(obj) {
+    # prepare marker genes from the database, category: Immune system, Liver, Pancreas, Kidney, Eye, Brain
+    gs_list <- gene_sets_prepare("/mnt/data/apps/sc-type/ScTypeDB_short_NHPeye.xlsx", "NHP_Eye")
+
+    # use a customized marker list
+    # gs_list <- gene_sets_prepare("./ocular_customized_markers.xlsx", "Eye")
+    # get cell-type by cell matrix
+    # NOTE: scRNAseqData parameter should correspond to your input scRNA-seq matrix.
+    # In case Seurat is used, it is either pbmc[["RNA"]]@scale.data (default),
+    # pbmc[["SCT"]]@scale.data, in case sctransform is used for normalization,
+    # or pbmc[["integrated"]]@scale.data, in case a joint analysis of multiple single-cell datasets is performed.
+    es.max <- sctype_score(scRNAseqData = obj[['SCT']]@scale.data, scaled = TRUE,
+                        gs = gs_list$gs_positive, gs2 = gs_list$gs_negative)
+
+    # merge by cluster
+    metadata <- obj@meta.data
+    clusters <- unique(obj@meta.data$seurat_clusters)
+    cL_resutls <- do.call("rbind",
+        lapply(
+            clusters,
+            function(cl) {
+                es.max.cl <- sort(rowSums(es.max[, rownames(metadata[metadata$seurat_clusters == cl, ])]),
+                    decreasing = TRUE)
+                cell_scores <- data.frame(cluster = cl,
+                        type = names(es.max.cl),
+                        scores = es.max.cl,
+                        ncells = sum(metadata$seurat_clusters == cl))
+                head(cell_scores, 10)
+            }
+        )
+    )
+    sctype_scores <- cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)
+
+    # set low-confident (low ScType score) clusters to "unknown"
+    sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] <- "Unknown"
+    print(data.frame(sctype_scores))
+
+    # add cell type annotations to obj
+    obj@meta.data$celltypes <- ""
+    for (j in unique(sctype_scores$cluster)){
+    cl_type <- sctype_scores[sctype_scores$cluster == j, ]
+    obj@meta.data$celltypes[obj@meta.data$seurat_clusters == j] <-
+        as.character(cl_type$type[1])
+    }
+    return(obj)
+}
+```
+
+```{r}
+seuratObj.integrated <- sctype(seuratObj.integrated)
+```
+
+
+## Show cell types on UMAP
+```{r, fig.height=14, fig.width=14}
+DimPlot(seuratObj.integrated, reduction = "umap", label = TRUE, repel = TRUE,
+    group.by = 'celltypes') +
+    theme(legend.position = "top")
+table(seuratObj.integrated$celltypes)
+```
+
+```{r, fig.height=14, fig.width=18}
+DimPlot(seuratObj.integrated, reduction = "umap", label = TRUE, repel = TRUE, split.by = 'sample', ncol = 4,
+    group.by = 'celltypes') +
+    theme(legend.position = "top")
+```
+
+```{r, fig.height=10, fig.width=14}
+DimPlot(seuratObj.integrated, reduction = "umap", label = TRUE, repel = TRUE, split.by = 'group', ncol = 2,
+    group.by = 'celltypes') +
+    theme(legend.position = "top")
+```
+
+
+## Number of cells in each cell type
+```{r}
+plot_celltypes <- function(srat) {
+    count_table <- table(srat@meta.data$celltypes, srat@meta.data$sample)
+    count_mtx <- as.data.frame.matrix(count_table)
+    count_mtx$celltypes <- rownames(count_mtx)
+    melt_mtx <- melt(count_mtx)
+
+    celltype_size <- aggregate(value ~ celltypes, data = melt_mtx, FUN = sum)
+    celltype_size <- celltype_size %>% dplyr::arrange(value)
+    celltype_size$celltypes <- factor(celltype_size$celltypes, levels = celltype_size$celltypes)
+    melt_mtx$celltypes <- factor(melt_mtx$celltypes, levels = celltype_size$celltypes)
+    colnames(melt_mtx)[2] <- "sample"
+
+    p1 <- ggplot(celltype_size, aes(y = celltypes, x = value)) +
+    geom_bar(position = "dodge", stat = "identity", fill = "grey60") +
+    theme_bw() + scale_x_log10() + xlab("Cells per celltype, log10 scale") + ylab("")
+
+    p2 <- ggplot(melt_mtx, aes(x = celltypes, y = value, fill = sample)) +
+        geom_bar(position = "fill", stat = "identity") + theme_bw() + coord_flip() +
+        scale_fill_manual(values=as.vector(distinctColorPalette(24))) +
+        ylab("Fraction of cells in each sample") + xlab("celltype number") + theme(legend.position = "top")
+
+    p2 + p1 + plot_layout(widths = c(3, 1))
+}
+```
+
+```{r fig.height=6, fig.width=14}
+plot_celltypes(seuratObj.integrated)
+```
+
+# RETINAL GANGLION CELLS (RGCs) ===
+
+```{r, fig.height=10, fig.width=14}
+DefaultAssay(seuratObj.integrated) <- "RNA"
+table(Idents(seuratObj.integrated))
+Idents(seuratObj.integrated) <- "celltypes"
+
+# hgd()
+# hgd_view()
+
+# RGCs are the projection neurons of the retina
+# markers of RGCs are:
+# RBPMS, which is not correctly annotated in macaque reference genome 
+# transcript ID for this is "ENSMFAG00000036911"
+# VlnPlot(seuratObj.integrated, features = "ENSMFAG00000036911")
+# # glutamate transporter VGLUT2 (SLC17A6 gene)
+# VlnPlot(seuratObj.integrated, features = "SLC17A6")
+# # gamma synuclein (SNCG)
+# VlnPlot(seuratObj.integrated, features = "SNCG")
+# # synaptotagmin 2 (SYT2)
+# VlnPlot(seuratObj.integrated, features = "SYT2")
+# # transgene GFP
+# VlnPlot(seuratObj.integrated, features = "GFP")
+
+VlnPlot(seuratObj.integrated, features = c("ENSMFAG00000036911", "SLC17A6", "SNCG","SYT2","GFPplus"), pt.size = 0.01, ncol=3, combine = TRUE)
+```
+
+
+## plot % RGCs for each sample/tissue/source
+```{r}
+Idents(seuratObj.integrated) <- "celltypes"
+cell_type_to_plot <- "Retinal ganglion cells"
+percentage_data <- seuratObj.integrated@meta.data %>%
+    group_by(sample, group) %>%
+    summarise(Percentage = sum(celltypes == cell_type_to_plot) / n(), .groups = 'drop')
+
+# pdf("Percent_RGC_per_sample.pdf", 8,6)
+ggplot(percentage_data, aes(x = sample, y = Percentage, fill = group)) +
+    # geom_bar(stat = "identity") +
+    geom_col(position = "dodge") +
+    labs(title = paste("Percentage of", cell_type_to_plot), fill = "dataset") +
+    theme_minimal() +
+    # facet_wrap(~group) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), plot.title = element_text(hjust = 0.5)) +
+    scale_y_continuous(labels = scales::percent) +
+    theme(plot.margin = margin(5, 5, 5, 20, "mm")) 
+# dev.off()
+```
+
+## plot % GFP+ cells for each cell type
+```{r}
+DefaultAssay(seuratObj.integrated) <- "RNA"
+Idents(seuratObj.integrated) <- "celltypes"
+
+gfp_expression <- FetchData(seuratObj.integrated, vars = "GFPplus")
+seuratObj.integrated$GFP_label <-  ifelse(gfp_expression > 0, "GFP+", "GFP-")
+
+seuratObj.integrated@meta.data %>%  group_by(group) %>% summarise(sum(GFP_label == "GFP+")) %>% as.data.frame()
+
+data_summary <- seuratObj.integrated@meta.data %>%
+    group_by(group, celltypes) %>%
+    summarise(ncells = n(), GFP_cells = sum(GFP_label == "GFP+"), GFP_cells_percent = GFP_cells / ncells * 100,.groups = 'drop')
+
+ggplot(data_summary, aes(x = celltypes, y = GFP_cells, fill = group)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    theme_minimal() +
+    labs(title = "Number of GFP+ Cells by Cell Type",
+        x = "Cell Type",
+        y = "Count of GFP+ Cells") +
+    scale_fill_brewer(palette = "Set1") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), plot.title = element_text(hjust = 0.5))
+
+ggplot(data_summary, aes(x = celltypes, y = GFP_cells_percent, fill = group)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    theme_minimal() +
+    labs(title = "% of GFP+ Cells by Cell Type",
+        x = "Cell Type",
+        y = "% of GFP+ Cells") +
+    scale_fill_brewer(palette = "Set1") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), plot.title = element_text(hjust = 0.5))
+```
+
+
+# RGC SUBTYPES 
+```{r}
+RGCs <- subset(seuratObj.integrated, idents = cell_type_to_plot)
+RGCs
+# re-running SCTransform normalization, PCA and Clustering           
+RGCs <- SCTransform(RGCs, method = "glmGamPoi", vst.flavor = "v2", verbose = TRUE)
+RGCs <- RunPCA(RGCs, npcs = 40)
+# ElbowPlot(RGCs)
+RGCs <- RunUMAP(RGCs, reduction = "pca", dims = 1:20)
+RGCs <- FindNeighbors(RGCs, reduction = "pca", dims = 1:20)
+RGCs <- FindClusters(RGCs, resolution = 0.05)
+table(RGCs$seurat_clusters)
+table(RGCs$group)
+```
+
+### Visualize clusters
+```{r, fig.height=7, fig.width=7}
+
+DimPlot(RGCs, reduction = "umap", label = TRUE, repel = TRUE) + theme(legend.position = "top")
+```
+
+```{r, fig.height=7, fig.width=7}
+p1 <- DimPlot(RGCs, reduction = "umap", group.by = "group") + theme(legend.position = "top")
+p1
+```
+
+```{r, fig.height=10, fig.width=14}
+DimPlot(RGCs, reduction = "umap", label = TRUE, split.by = "sample", ncol = 4) + theme(legend.position = "top")
+```
+
+
+# Redo integration for RGCs only
+
+```{r, eval = FALSE}
+sizes <- sapply(ls(), function(x) format(object.size(get(x)), units = 'GiB'))
+sorted <- sort(sizes, decreasing = TRUE)
+data.frame(Object = names(sorted), Size = sorted)
+```
+
+```{r}
+RGC.integrated <- qread("RGC.integrated.qs")
+table(RGC.integrated$seurat_clusters)
+table(RGC.integrated$group)
+table(RGC.integrated$sample)
+```
+
+## load previous single dataset objects and do cell type annotation
+The data has been already normalized and clustered, but no cell type annotation  
+```{r, eval = FALSE}
+Idents(seuratObj) <- 'group'
+NEFH <- subset(seuratObj, idents = 'NEFH')
+CAG <- subset(seuratObj, idents = 'CAG')
+```
+
+### redo normalization and annotation for the datasets seperately
+#### NEFH promoter samples
+
+```{r}
+NEFH <- qread("NEFH.qs")
+```
+
+```{r, eval = FALSE}
+NEFH <- SCTransform(NEFH, method = "glmGamPoi", vst.flavor = "v2",
+        vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"), verbose = TRUE)
+
+NEFH <- RunPCA(NEFH, npcs = 40)
+# ElbowPlot(seuratObj, ndims = 40)
+NEFH <- RunUMAP(NEFH, reduction = "pca", dims = 1:40)
+NEFH <- FindNeighbors(NEFH, reduction = "pca", dims = 1:40)
+NEFH <- FindClusters(NEFH, resolution = 0.1)
+table(NEFH$seurat_clusters)
+
+NEFH <- sctype(NEFH)
+table(NEFH$celltypes)
+```
+
+```{r, fig.height=10, fig.width=12}
+DimPlot(NEFH, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'celltypes') + theme(legend.position = "top")
+DimPlot(NEFH, reduction = "umap", group.by = "sample") + theme(legend.position = "top")
+DimPlot(NEFH, reduction = "umap", label = TRUE, split.by = "sample", group.by = 'celltypes', ncol = 4) + theme(legend.position = "top")
+Idents(NEFH) <- "celltypes"
+DefaultAssay(NEFH) <- 'RNA'
+VlnPlot(NEFH, features = c("ENSMFAG00000036911", "SLC17A6", "SNCG","SYT2","GFP"), pt.size = 0.01, ncol=3, combine = TRUE)
+```
+
+```{r, eval = FALSE}
+qsave(NEFH, file = "NEFH.qs")
+```
+
+
+#### CAG promoter samples
+
+```{r}
+CAG <- qread("CAG.qs")
+```
+
+```{r, eval = FALSE}
+CAG <- SCTransform(CAG, method = "glmGamPoi", vst.flavor = "v2",
+        vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"), verbose = TRUE)
+
+CAG <- RunPCA(CAG, npcs = 40)
+# ElbowPlot(seuratObj, ndims = 40)
+CAG <- RunUMAP(CAG, reduction = "pca", dims = 1:40)
+CAG <- FindNeighbors(CAG, reduction = "pca", dims = 1:40)
+CAG <- FindClusters(CAG, resolution = 0.1)
+table(CAG$seurat_clusters)
+
+CAG <- sctype(CAG)
+table(CAG$celltypes)
+```
+
+```{r, fig.height=10, fig.width=12}
+DimPlot(CAG, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'celltypes') + theme(legend.position = "top")
+DimPlot(CAG, reduction = "umap", group.by = "sample") + theme(legend.position = "top")
+DimPlot(CAG, reduction = "umap", label = TRUE, split.by = "sample", group.by = 'celltypes', ncol = 4) + theme(legend.position = "top")
+Idents(CAG) <- "celltypes"
+DefaultAssay(CAG) <- 'RNA'
+VlnPlot(CAG, features = c("ENSMFAG00000036911", "SLC17A6", "SNCG","SYT2","GFP"), pt.size = 0.01, ncol=3, combine = TRUE)
+```
+
+```{r, eval = FALSE}
+qsave(CAG, file = "CAG.qs")
+```
+
+
+## extract RGCs
+```{r, eval = FALSE}
+Idents(NEFH) <- "celltypes"
+NEFH_RGCs <- subset(NEFH, idents = "Retinal ganglion cells")
+
+Idents(CAG) <- "celltypes"
+CAG_RGCs <- subset(CAG, idents = "Retinal ganglion cells")
+
+cat('Number of RGCs: \n')
+dim(NEFH_RGCs)[2]
+dim(CAG_RGCs)[2]
+```
+
+## Integrate RGCs from NEFH and CAG promoter samples
+```{r, eval = FALSE}
+## Split object and SCTransform normalization  
+RGC.list <- c(SplitObject(NEFH_RGCs, split.by = "sample"), SplitObject(CAG_RGCs, split.by = "sample"))
+RGC.list <- Filter(function(i) { ncol(i) >= 50 }, RGC.list)
+
+RGC.list <- lapply(RGC.list, FUN = SCTransform, method = "glmGamPoi", vst.flavor = "v2",
+        vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"), verbose = TRUE)
+
+## Select features and prepare integration 
+RGC.features <- SelectIntegrationFeatures(object.list = RGC.list, nfeatures = 3000)
+RGC.list <- PrepSCTIntegration(object.list = RGC.list, anchor.features = RGC.features)
+
+## Identify anchors and integrate the datasets
+### using the samples with high RGCs as references (set3)
+anchors <- FindIntegrationAnchors(object.list = RGC.list, normalization.method = "SCT",
+    reference = seq(1,7),
+    anchor.features = RGC.features, reduction = "rpca")
+RGC.integrated <- IntegrateData(anchorset = anchors, k.weight = 100, normalization.method = "SCT") # k.weight should less than sample size
+
+# add groups
+group <- ifelse(grepl("GTSAMPLE2045", RGC.integrated$sample), "CAG", "NEFH")
+RGC.integrated  <- AddMetaData(RGC.integrated, metadata = group, col.name = "group")
+
+```
+
+== Save object RGC.list
+```{r, eval = FALSE}
+qsave(RGC.list, file = "RGC.list.qs")
+```
+
+## sub-cluster on the integrated RGCs
+```{r, eval = FALSE}
+DefaultAssay(RGC.integrated) <- "integrated"
+RGC.integrated <- RunPCA(RGC.integrated, npcs = 30)
+# ElbowPlot(RGC.integrated, ndims = 30)
+
+RGC.integrated <- RunUMAP(RGC.integrated, reduction = "pca", dims = 1:15)
+RGC.integrated <- FindNeighbors(RGC.integrated, reduction = "pca", dims = 1:15)
+# try 0.3-0.5, give 26, 28, 30 clusters
+RGC.integrated <- FindClusters(RGC.integrated, resolution = 0.03)
+table(RGC.integrated$seurat_clusters)
+```
+
+== Save integrated object
+```{r, eval = FALSE}
+qsave(RGC.integrated, file = "RGC.integrated.qs")
+```
+
+## Plots after integration   
+```{r, fig.height=10, fig.width=12}
+DimPlot(RGC.integrated, reduction = "umap", label = TRUE, repel = TRUE) + theme(legend.position = "top")
+DimPlot(RGC.integrated, reduction = "umap", group.by = "sample") + theme(legend.position = "top")
+DimPlot(RGC.integrated, reduction = "umap", group.by = "group") + theme(legend.position = "top")
+DimPlot(RGC.integrated, reduction = "umap", label = TRUE, split.by = "sample", ncol = 4) + theme(legend.position = "top")
+DimPlot(RGC.integrated, reduction = "umap", label = TRUE, split.by = "group", ncol = 2) + theme(legend.position = "top")
+```
+
+** plot markers **
+```{r, fig.height=10, fig.width=12}
+DefaultAssay(RGC.integrated) <- "SCT"
+
+# RBPMS, which is not correctly annotated in macaque reference genome 
+# transcript ID for this is "ENSMFAG00000036911"
+# glutamate transporter VGLUT2 (SLC17A6 gene)
+# gamma synuclein (SNCG)
+# synaptotagmin 2 (SYT2)
+
+genes <- c("ENSMFAG00000036911", "SLC17A6", "SNCG","SYT2")
+VlnPlot(RGC.integrated, features = genes)
+
+
+#### markers from Kamil, MEIS2 is OFF gene
+genes <- c("NEFH", "SNCG", "NEFL", "SLC17A6", "THY1", "MEIS2",'CA8', "GFPplus")
+VlnPlot(RGC.integrated, features = genes)
+
+# new markers
+VlnPlot(RGC.integrated, features = c("ELAVL2", "RBFOX3", "IRX1","IRX2", 'KCNA1', 'SPP1'))
+```
+
+## RGC cluster markers
+```{r, eval = FALSE}
+RGC.integrated <- PrepSCTFindMarkers(RGC.integrated, assay = "SCT", verbose = TRUE)
+RGC.markers <- FindAllMarkers(RGC.integrated, assay = "SCT", verbose = TRUE)
+# 25 top markers of clusters
+RGC.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 25, wt = avg_log2FC) -> top25
+```
+
+** plot subtypes **
+```{r}
+DefaultAssay(RGC.integrated) <- "integrated"
+
+cluster_to_celltype <- c('0' = 'Midget OFF',  '1' = 'Midget ON', '2' = 'Other', 
+    '3' = 'Parasol OFF', '4' = 'Parasol ON', '5' = "Other", '6' = "Other")
+
+RGC.integrated@meta.data$subtype <- cluster_to_celltype[RGC.integrated@meta.data$seurat_clusters]
+table(RGC.integrated$subtype)
+
+# Calculate the percentage of each cell type
+celltype_percentages <- table(RGC.integrated$subtype) / length(RGC.integrated$subtype) * 100
+
+# Convert to dataframe for ggplot
+celltype_df <- as.data.frame(celltype_percentages)
+names(celltype_df) <- c("subtype", "percentage")
+
+# Plot
+
+# Manually specify colors for each cell type
+manual_colors <- c("Midget OFF" = "#00bfff", 
+                   "Midget ON" = "#0073ff", 
+                   "Parasol OFF" = "#ff8c00", 
+                   "Parasol ON" = "#ff5500", 
+                   "Other" = "purple")
+                   
+ggplot(celltype_df, aes(x = "", y = percentage, fill = subtype)) +
+    geom_bar(width = 1, stat = "identity") +
+    coord_polar("y", start = 0) +
+    theme_void() +
+    labs(fill = "Cell Type") +
+    geom_text(aes(label = paste0(round(percentage, 1), "%")), 
+                position = position_stack(vjust = 0.5)) +
+    scale_fill_manual(values = manual_colors) +
+    ggtitle("Percentage of RGC sub-types")
+
+```
+
+## marker expression in transduced vs non-transduced cells by GFP
+```{r}
+DefaultAssay(RGC.integrated) <- "RNA"
+
+Idents(RGC.integrated) <- "subtype"
+gfp_pos_GRC <- subset(RGC.integrated, subset = GFPplus > 0)
+gfp_neg_GRC <- subset(RGC.integrated, subset = GFPplus == 0)
+
+genes <- c("NEFH", "SNCG", "NEFL", "SLC17A6", "THY1")
+
+cat('GFP+ RGCs:\n')
+table(gfp_pos_GRC$group)
+```
+
+** GFP positive RGCs **
+```{r}
+DefaultAssay(gfp_pos_GRC) <- "RNA"
+VlnPlot(gfp_pos_GRC, features = genes)
+```
+
+** GFP negative RGCs **
+```{r}
+DefaultAssay(gfp_neg_GRC) <- "RNA"
+VlnPlot(gfp_neg_GRC, features = genes)
+```
+
+** GFP positive RGCs **
+```{r}
+DotPlot(gfp_pos_GRC, features = genes, cols = c("white", 'blue'), scale = FALSE) +  RotatedAxis() + coord_flip()
+```
+
+** GFP negative RGCs **
+```{r}
+DotPlot(gfp_neg_GRC, features = genes, cols = c("white", 'blue'), scale = FALSE) +  RotatedAxis() + coord_flip()
+```
+
+### label and compare GFP+ vs GFP-
+```{r}
+DefaultAssay(RGC.integrated) <- "RNA"
+gfp_expression <- FetchData(RGC.integrated, vars = "GFPplus")
+RGC.integrated$GFP_label <-  ifelse(gfp_expression > 0, "GFP+", "GFP-")
+
+Idents(RGC.integrated) <- "GFP_label"
+genes <- c("NEFH", "SNCG", "NEFL", "SLC17A6", "THY1")
+```
+
+```{r}
+DefaultAssay(RGC.integrated) <- "SCT"
+VlnPlot(RGC.integrated, features = genes)
+```
+```{r, fig.height=12, fig.width=18}
+FeaturePlot(RGC.integrated, features = genes, split.by = 'GFP_label')
+```
+
+```{r}
+DotPlot(RGC.integrated, features = genes, cols = c("white", 'blue'),  scale = FALSE) +  RotatedAxis() + coord_flip()
+```

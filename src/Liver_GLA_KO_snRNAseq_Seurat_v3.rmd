@@ -1,0 +1,769 @@
+---
+title: "Liver_GLA_KO_snRNAseq - Seurat_v3"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: yes
+    code_folding: hide
+---
+
+# Abstract
+This is our first run of Single nucleus RNAseq, to explore the galactosidase alpha (GLA) knock out 
+effect in liver cells for Fabry disease. In this version, we remove cells with >10% mt expression.
+
+This version filtered more cells (>10%) with high mitochondrial gene expression. 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE,
+                      warning = FALSE,
+                      comment = "")
+```
+
+```{r}
+library(biomaRt)
+library(scater)
+library(Seurat)
+library(HGNChelper)
+library(RColorBrewer)
+library(sctransform)
+library(glmGamPoi)
+library(patchwork)
+library(tidyverse)
+library(reshape2)
+library(openxlsx)
+library(future)
+library(Scillus)
+library(fgsea)
+library(msigdbr)
+library(ggpubr)
+library(ggVennDiagram)
+Sys.setenv(PROJ_LIB="/home/ubuntu/anaconda3/envs/r4.2.1/share/proj")
+Sys.setenv(GDAL_DATA="/home/ubuntu/anaconda3/envs/r4.2.1/share/gdal")
+source("/mnt/data/apps/sc-type/R/gene_sets_prepare.R")
+source("/mnt/data/apps/sc-type/R/sctype_score_.R")
+setwd('~/Liver_GLA_KO_snRNAseq/v3_filter_more_mt')
+set.seed(123)
+```
+
+# Load and combine sample feature_bc_matrix from cellranger 
+```{r}
+rds_paths <- list.files('../nf-core/output/cellranger/cellranger/mtx_conversions/', pattern = ".rds", full.names = TRUE)
+rds_names <-  gsub("_matrix.rds$", "", basename(rds_paths))
+rds_list <- lapply(rds_paths, readRDS)
+names(rds_list) <- rds_names
+# combine samples
+seuratObj <- merge(rds_list[[1]], y = rds_list[2:4], add.cell.ids = rds_names, project = "liver_gla_ko")
+# add sample names
+cells <- rownames(seuratObj@meta.data)
+seuratObj$sample <- str_split_fixed(cells, "_", 3)[, 2]
+seuratObj$group <- gsub('[0-9]', '', seuratObj$sample)
+```
+
+- The initial object 
+```{r}
+seuratObj
+table(seuratObj[[]]$sample)
+head(seuratObj, 5)
+```
+
+# QC and selecting cells for further analysis
+
+## Add %mitochondrial counts and cell cycle scores 
+```{r, eval = FALSE}
+seuratObj[["percent.mt"]] <- PercentageFeatureSet(seuratObj, pattern = "^mt-")
+
+# Basic function to convert human to mouse gene names
+convertHumanGeneList <- function(x) {
+
+    human <- useEnsembl("ensembl", dataset = "hsapiens_gene_ensembl", host = "https://dec2021.archive.ensembl.org")
+    mouse <- useEnsembl("ensembl", dataset = "mmusculus_gene_ensembl", host = "https://dec2021.archive.ensembl.org")
+
+    genesV2 <- getLDS(attributes = c("hgnc_symbol"), filters = "hgnc_symbol",
+        values = x, mart = human, attributesL = c("mgi_symbol"), martL = mouse, uniqueRows = TRUE)
+
+    mousex <- unique(genesV2[, 2])
+
+    return(mousex)
+}
+
+s.genes <- convertHumanGeneList(cc.genes.updated.2019$s.genes)
+g2m.genes <- convertHumanGeneList(cc.genes.updated.2019$g2m.genes)
+
+seuratObj <- CellCycleScoring(seuratObj, s.features = s.genes, g2m.features = g2m.genes)
+```
+
+## Filter cells 
+- Filter cells by:  
+1, umi/nCount_RNA, low-quality cells (very low UMI counts) or doublets (very high UMI counts)  
+2, gene/nFeature_RNA, remove potential low-quality cells and multiplets as above  
+3, percent.mt, according to v1, two clusters have high mt, use more strict cutoff 10% here  
+note that this step directly removes cells with high mt, the regress.out function later   
+removes variations from mt and cell-cyle gene expression.   
+4, our cutoff is chosen by visulizing data in Loupe browser    
+```{r, eval = FALSE}
+seuratObj <- subset(seuratObj, subset = nCount_RNA > 512 &  nCount_RNA < 65536 &
+    nFeature_RNA > 300 & nFeature_RNA < 7000 & percent.mt < 10)
+```
+
+## SCTransform normalization and dimensionality reduction
+- regressing out unwanted variation (mitochondrial, cell cyle, etc.)
+```{r, eval = FALSE}
+seuratObj <- SCTransform(seuratObj, method = "glmGamPoi", vst.flavor = "v2",
+        vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"), verbose = TRUE) %>%
+    RunPCA(npcs = 30) %>%
+    RunUMAP(reduction = "pca", dims = 1:30) %>%
+    FindNeighbors(reduction = "pca", dims = 1:30) %>%
+    FindClusters(resolution = 0.5)
+```
+
+== Save processed object
+```{r, eval = FALSE}
+saveRDS(seuratObj, file = "liver_obj.rds")
+```
+
+
+## Visualize data before integration  
+== Load filtered Seurat obj instead of re-run the following steps 
+```{r}
+seuratObj <- readRDS("liver_obj.rds")
+```
+
+- The object after filtering 
+```{r}
+seuratObj
+table(seuratObj[[]]$sample)
+head(seuratObj, 5)
+```
+
+### QC metrics as a violin plot 
+- by initial clusters
+```{r, fig.height=10, fig.width=12}
+VlnPlot(seuratObj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), pt.size = 0, ncol = 1)
+```
+
+- by samples
+```{r, fig.height=6, fig.width=12}
+VlnPlot(seuratObj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+    group.by = 'sample',
+    pt.size = 0.2, ncol = 3)
+```
+
+### Visualize clustered cells  
+```{r, fig.height=7, fig.width=14}
+p1 <- DimPlot(seuratObj, reduction = "umap", group.by = "sample") + theme(legend.position = "top")
+p2 <- DimPlot(seuratObj, reduction = "umap", label = TRUE, repel = TRUE) + NoLegend()
+p1 + p2
+DimPlot(seuratObj, reduction = "umap", label = FALSE, split.by = "sample", ncol = 4) + theme(legend.position = "top")
+```
+
+
+# Data Integration  
+We want to identify cell types which are present in all samples/conditions/modalities within our dataset,  
+and therefore would like to observe a representation of cells from both samples/conditions/modalities in every cluster.  
+Reference: https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/06_integration.md  
+- Execute the normalization, variance estimation, and identification of the most variable genes for each sample   
+- Perform integration of cells across conditions using the most variant genes to identify cells most similar to each other  
+
+== Load object list `seuratObj.list`
+```{r, eval = FALSE}
+seuratObj.list <- readRDS("liver_obj.list.rds")
+```
+
+== Load objects `liver_obj.integrated`
+```{r}
+seuratObj.integrated <- readRDS("liver_obj.integrated.rds")
+table(seuratObj.integrated$seurat_clusters)
+```
+
+## Split object and SCTransform normalization  
+split the dataset into a list of two seurat objects (GLA_KO and WT), 
+normalize and identify variable features for each dataset independently.  
+```{r, eval = FALSE}
+seuratObj.list <- SplitObject(seuratObj, split.by = "sample")
+
+for (i in 1:length(seuratObj.list)) {
+    seuratObj.list[[i]] <- SCTransform(seuratObj.list[[i]], method = "glmGamPoi", vst.flavor = "v2",
+        vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"), verbose = TRUE) %>%
+    RunPCA(npcs = 30)
+}
+```
+
+## Select features and prepare integration 
+Select features that are repeatedly variable across datasets for integration, 
+and run `PrepSCTIntegration`, which ensures that all necessary Pearson residuals have been calculated.  
+```{r, eval = FALSE}
+seuratObj.features <- SelectIntegrationFeatures(object.list = seuratObj.list, nfeatures = 3000)
+seuratObj.list <- PrepSCTIntegration(object.list = seuratObj.list, anchor.features = seuratObj.features)
+```
+
+== Save object `seuratObj.list`
+```{r, eval = FALSE}
+saveRDS(seuratObj.list, file = "liver_obj.list.rds")
+```
+
+## Identify anchors and integrate the datasets
+### using WT1 and WT2 as references (recomanded by the Seurat Authors)
+When using a set of specified references, anchors are first found between each query and each reference. 
+The references are then integrated through pairwise integration. Each query is then mapped to the integrated reference.
+Make sure to set normalization.method = **"SCT"**, and reduction = **"rpca"** for reciprocal PCA  
+```{r, eval = FALSE}
+anchors <- FindIntegrationAnchors(object.list = seuratObj.list, normalization.method = "SCT",
+    reference = c(3, 4),
+    anchor.features = seuratObj.features, reduction = "rpca")
+seuratObj.integrated <- IntegrateData(anchorset = anchors, normalization.method = "SCT")
+```
+
+
+# Cluster on the integrated dataset
+## PCA and Clustering  
+```{r, eval = FALSE}
+DefaultAssay(seuratObj.integrated) <- "integrated"
+seuratObj.integrated <- RunPCA(seuratObj.integrated, npcs = 20)
+seuratObj.integrated <- RunUMAP(seuratObj.integrated, reduction = "pca", dims = 1:20)
+seuratObj.integrated <- FindNeighbors(seuratObj.integrated, reduction = "pca", dims = 1:20)
+## try resolution 0.1-0.8, 0.3 gives four subtypes of hepatocyte
+seuratObj.integrated <- FindClusters(seuratObj.integrated, resolution = 0.3)
+table(seuratObj.integrated$seurat_clusters)
+```
+
+## Plots after integration   
+```{r, fig.height=7, fig.width=14}
+p1 <- DimPlot(seuratObj.integrated, reduction = "umap", group.by = "sample") + theme(legend.position = "top")
+p2 <- DimPlot(seuratObj.integrated, reduction = "umap", label = TRUE, repel = TRUE) + NoLegend()
+p1 + p2
+DimPlot(seuratObj.integrated, reduction = "umap", label = FALSE, split.by = "sample") + theme(legend.position = "top")
+```
+
+## Number of cells in each cluster
+```{r}
+plot_integrated_clusters <- function(srat) { 
+    count_table <- table(srat@meta.data$seurat_clusters, srat@meta.data$sample)
+    count_mtx <- as.data.frame.matrix(count_table)
+    count_mtx$clusters <- rownames(count_mtx)
+    melt_mtx <- melt(count_mtx)
+
+    celltype_size <- aggregate(value ~ clusters, data = melt_mtx, FUN = sum)
+    celltype_size <- celltype_size %>% dplyr::arrange(value)
+    celltype_size$clusters <- factor(celltype_size$clusters, levels = celltype_size$clusters)
+    melt_mtx$clusters <- factor(melt_mtx$clusters, levels = celltype_size$clusters)
+    colnames(melt_mtx)[2] <- "sample"
+
+    p1 <- ggplot(celltype_size, aes(y = clusters, x = value)) +
+    geom_bar(position = "dodge", stat = "identity", fill = "grey60") +
+    theme_bw() + scale_x_log10() + xlab("Cells per cluster, log10 scale") + ylab("")
+
+    p2 <- ggplot(melt_mtx, aes(x = clusters, y = value, fill = sample)) +
+        geom_bar(position = "fill", stat = "identity") + theme_bw() + coord_flip() +
+        scale_fill_brewer(palette = "Set2") +
+        ylab("Fraction of cells in each sample") + xlab("cluster number") + theme(legend.position = "top")
+
+    p2 + p1 + plot_layout(widths = c(3, 1))
+}
+```
+```{r fig.height=8, fig.width=14}
+plot_integrated_clusters(seuratObj.integrated)
+```
+
+
+# Cell type annotation
+## Apply marker based tool `sc-type`
+```{r, eval = FALSE}
+# prepare marker genes from the database, category: Immune system, Liver, Pancreas, Kidney, Eye, Brain
+gs_list <- gene_sets_prepare("/mnt/data/apps/sc-type/ScTypeDB_short.xlsx", "Liver")
+# get cell-type by cell matrix
+# NOTE: scRNAseqData parameter should correspond to your input scRNA-seq matrix.
+# In case Seurat is used, it is either pbmc[["RNA"]]@scale.data (default),
+# pbmc[["SCT"]]@scale.data, in case sctransform is used for normalization,
+# or pbmc[["integrated"]]@scale.data, in case a joint analysis of multiple single-cell datasets is performed.
+es.max <- sctype_score(scRNAseqData = seuratObj.integrated[['integrated']]@scale.data, scaled = TRUE,
+                      gs = gs_list$gs_positive, gs2 = gs_list$gs_negative)
+
+# merge by cluster
+metadata <- seuratObj.integrated@meta.data
+clusters <- unique(seuratObj.integrated@meta.data$seurat_clusters)
+cL_resutls <- do.call("rbind",
+    lapply(
+        clusters,
+        function(cl) {
+            es.max.cl <- sort(rowSums(es.max[, rownames(metadata[metadata$seurat_clusters == cl, ])]),
+                decreasing = TRUE)
+            cell_scores <- data.frame(cluster = cl,
+                    type = names(es.max.cl),
+                    scores = es.max.cl,
+                    ncells = sum(metadata$seurat_clusters == cl))
+            head(cell_scores, 10)
+        }
+    )
+)
+sctype_scores <- cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)
+
+# set low-confident (low ScType score) clusters to "unknown"
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] <- "Unknown"
+sctype_scores
+
+# add cell type annotations to obj
+seuratObj.integrated@meta.data$celltypes <- ""
+for (j in unique(sctype_scores$cluster)){
+  cl_type <- sctype_scores[sctype_scores$cluster == j, ]
+  seuratObj.integrated@meta.data$celltypes[seuratObj.integrated@meta.data$seurat_clusters == j] <-
+    as.character(cl_type$type[1])
+}
+
+```
+
+== Save object `seuratObj.integrated`
+```{r, eval = FALSE}
+saveRDS(seuratObj.integrated, file = "liver_obj.integrated.rds")
+```
+
+## Show cell types on UMAP
+```{r, fig.height=7, fig.width=14}
+DimPlot(seuratObj.integrated, reduction = "umap", label = TRUE, repel = TRUE, split.by = 'sample',
+    group.by = 'celltypes') +
+    theme(legend.position = "top")
+```
+
+## Number of cells in each cell type
+```{r}
+plot_integrated_celltypes <- function(srat) { 
+    count_table <- table(srat@meta.data$celltypes, srat@meta.data$sample)
+    count_mtx <- as.data.frame.matrix(count_table)
+    count_mtx$celltypes <- rownames(count_mtx)
+    melt_mtx <- melt(count_mtx)
+
+    celltype_size <- aggregate(value ~ celltypes, data = melt_mtx, FUN = sum)
+    celltype_size <- celltype_size %>% dplyr::arrange(value)
+    celltype_size$celltypes <- factor(celltype_size$celltypes, levels = celltype_size$celltypes)
+    melt_mtx$celltypes <- factor(melt_mtx$celltypes, levels = celltype_size$celltypes)
+    colnames(melt_mtx)[2] <- "sample"
+
+    p1 <- ggplot(celltype_size, aes(y = celltypes, x = value)) +
+    geom_bar(position = "dodge", stat = "identity", fill = "grey60") +
+    theme_bw() + scale_x_log10() + xlab("Cells per celltype, log10 scale") + ylab("")
+
+    p2 <- ggplot(melt_mtx, aes(x = celltypes, y = value, fill = sample)) +
+        geom_bar(position = "fill", stat = "identity") + theme_bw() + coord_flip() +
+        scale_fill_brewer(palette = "Set2") +
+        ylab("Fraction of cells in each sample") + xlab("celltype number") + theme(legend.position = "top")
+
+    p2 + p1 + plot_layout(widths = c(3, 1))
+}
+```
+
+```{r fig.height=6, fig.width=14}
+plot_integrated_celltypes(seuratObj.integrated)
+```
+
+# Cluster markers analysis
+== Load all cluster markers obj
+```{r}
+all.markers <- readRDS("all.cluster_markers.rds")
+# filter out mt genes
+# all.markers <- all.markers %>% filter(!grepl('mt-', gene))
+head(all.markers)
+```
+
+## normalize and scale for RNA assay
+```{r, eval = FALSE}
+DefaultAssay(seuratObj.integrated) <- "RNA"
+seuratObj.integrated <- NormalizeData(seuratObj.integrated, normalization.method = "LogNormalize", scale.factor = 10000)
+seuratObj.integrated <- FindVariableFeatures(seuratObj.integrated, selection.method = "vst", nfeatures = 3000)
+plan(multicore)
+seuratObj.integrated <- ScaleData(seuratObj.integrated,
+    vars.to.regress = c("percent.mt", "S.Score", "G2M.Score"))
+seuratObj.integrated <- RunPCA(seuratObj.integrated, npcs = 30)
+# find optimal number of PCs, all 20 PCs are significant
+seuratObj.integrated <-  JackStraw(seuratObj.integrated, num.replicate = 100)
+seuratObj.integrated  <- ScoreJackStraw(seuratObj.integrated, dims = 1:20)
+JackStrawPlot(seuratObj.integrated, dims = 1:20)
+plan(sequential)
+```
+
+## Find all markers
+```{r, eval = FALSE}
+seuratObj.integrated <- PrepSCTFindMarkers(seuratObj.integrated, assay = "SCT", verbose = TRUE)
+plan(multicore)
+all.markers <- FindAllMarkers(seuratObj.integrated, assay = "SCT", verbose = TRUE)
+plan(sequential)
+```
+
+## Save marker genes
+```{r, eval = FALSE}
+all.markers <- all.markers %>% relocate(gene)
+write_tsv(all.markers, "all.cluster_markers.tsv")
+
+saveRDS(all.markers, file = "all.cluster_markers.rds")
+```
+
+## Show markers expression in violin plots {.tabset}
+1. Show top 5 marker genes for hepatocyte each cluster  
+2. Show marker genes for subtypes of hepatocytes in paper Zhun et al.  
+3. Show 6 landmark genes for liver zonation: Glul and Cyp2e1 for CV (central vein) and 
+Ass1, Asl10, Alb8 and Cyp2f2 for PN (portal node)  
+
+```{r}
+top5 <- all.markers %>%
+    filter(cluster %in% c(0, 2, 3)) %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC)
+
+seuratObj.integrated@meta.data$celltype_cluster <- paste0(seuratObj.integrated$celltypes, '_',
+    seuratObj.integrated$seurat_clusters)
+Idents(seuratObj.integrated) <- "celltype_cluster"
+subtypes <- c('Hepatocytes_0', 'Hepatocytes_2', 'Hepatocytes_3',
+    'Hepatic stellate cells_4',
+    'Endothelial cell_5', 'Endothelial cell_6',
+    'Kupffer cells_7', 'Hematopoietic cell_9', 'Cholangiocytes_10',
+    'Unknown_1', 'Unknown_8')
+
+hepatocytes <- c('Hepatocytes_0', 'Hepatocytes_2', 'Hepatocytes_3')
+seuratObj.integrated@meta.data$celltype_cluster <- factor(Idents(seuratObj.integrated), levels = subtypes)
+DefaultAssay(seuratObj.integrated) <- "SCT"
+```
+
+```{r, results = 'asis', fig.height=16, fig.width=6}
+for (i in subtypes[1:3]) {
+    c <- strsplit(i, '_')[[1]][2]
+    markers <- top5[top5$cluster == c, ]$gene
+    cat('### ', i, '\n')
+    p <- VlnPlot(seuratObj.integrated, features = markers,
+            group.by = 'celltype_cluster', pt.size = 0, combine = TRUE, ncol = 1) +
+        theme(legend.position = 'none', plot.margin = margin(l = 30))
+    print(p)
+    cat('\n\n')
+}
+```
+
+### Marker genes from Zhu et al.
+```{r, fig.height=18, fig.width=6}
+markers_zhu <- c('Ttr', 'Serpina1a', 'Tat', 'Alb', 'Mlxipl', 'Insr')
+VlnPlot(seuratObj.integrated, features = markers_zhu,
+    group.by = 'celltype_cluster', pt.size = 0, combine = TRUE, ncol = 1) +
+    theme(legend.position = 'none', plot.margin = margin(l = 30))
+```
+
+### Zonation mark genes 
+```{r, fig.height=18, fig.width=6}
+markers_zonation <- c('Glul', 'Cyp2e1', 'Ass1', 'Asl', 'Alb', 'Cyp2f2')
+VlnPlot(seuratObj.integrated, features = markers_zonation,
+    group.by = 'celltype_cluster', pt.size = 0, combine = TRUE, ncol = 1) +
+    theme(legend.position = 'none', plot.margin = margin(l = 30))
+```
+
+## Dot plots using average expression {.tabset}
+```{r}
+seuratObj.integrated@meta.data %>%
+    group_by(celltype_cluster) %>%
+    summarise(nCell = n(), nUMI = mean(nCount_SCT), nGene = mean(nFeature_SCT))
+```
+
+### Markers for hepatocytes
+```{r, fig.height=6, fig.width=12}
+top5 <- all.markers %>%
+    filter(cluster %in% c(0, 2, 3)) %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC)
+Idents(seuratObj.integrated) <- factor(Idents(seuratObj.integrated), levels = rev(subtypes))
+DotPlot(seuratObj.integrated, features = unique(top5$gene), cols = c("white", 'blue'), dot.scale = 8) +
+    RotatedAxis()
+```
+- only show hepatocytes
+```{r, fig.height=3, fig.width=12}
+DotPlot(subset(seuratObj.integrated, idents = hepatocytes), features = unique(top5$gene), cols = c("white", 'blue'), dot.scale = 8) +
+    RotatedAxis()
+```
+
+### Markers for heptatic stellate cells
+```{r, fig.height=6, fig.width=12}
+top5 <- all.markers %>%
+    filter(cluster %in% c(4)) %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC)
+Idents(seuratObj.integrated) <- factor(Idents(seuratObj.integrated), levels = rev(subtypes))
+DotPlot(seuratObj.integrated, features = unique(top5$gene), cols = c("white", 'blue'), dot.scale = 8) +
+    RotatedAxis()
+```
+
+### Markers for Endothelial cells
+```{r, fig.height=6, fig.width=12}
+top5 <- all.markers %>%
+    filter(cluster %in% c(5, 6)) %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC)
+Idents(seuratObj.integrated) <- factor(Idents(seuratObj.integrated), levels = rev(subtypes))
+DotPlot(seuratObj.integrated, features = unique(top5$gene), cols = c("white", 'blue'), dot.scale = 8) +
+    RotatedAxis()
+```
+
+### Markers for hematopoietic cells
+```{r, fig.height=6, fig.width=12}
+top5 <- all.markers %>%
+    filter(cluster %in% c(9)) %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC)
+Idents(seuratObj.integrated) <- factor(Idents(seuratObj.integrated), levels = rev(subtypes))
+DotPlot(seuratObj.integrated, features = unique(top5$gene), cols = c("white", 'blue'), dot.scale = 8) +
+    RotatedAxis()
+```
+
+### Markers for Cholangiocytes
+```{r, fig.height=6, fig.width=12}
+top5 <- all.markers %>%
+    filter(cluster %in% c(10)) %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC)
+Idents(seuratObj.integrated) <- factor(Idents(seuratObj.integrated), levels = rev(subtypes))
+DotPlot(seuratObj.integrated, features = unique(top5$gene), cols = c("white", 'blue'), dot.scale = 8) +
+    RotatedAxis()
+```
+
+### Markers for unknown clusters
+```{r, fig.height=6, fig.width=12}
+top5 <- all.markers %>%
+    filter(cluster %in% c(1, 8)) %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC)
+Idents(seuratObj.integrated) <- factor(Idents(seuratObj.integrated), levels = rev(subtypes))
+DotPlot(seuratObj.integrated, features = unique(top5$gene), cols = c("white", 'blue'), dot.scale = 8) +
+    RotatedAxis()
+```
+
+
+### Markers in published papers
+```{r, fig.height=6, fig.width=8}
+Idents(seuratObj.integrated) <- factor(Idents(seuratObj.integrated), levels = rev(subtypes))
+DotPlot(seuratObj.integrated, features = unique(c(markers_zonation, markers_zhu)),
+        cols = c("white", 'blue'), dot.scale = 8) +
+    RotatedAxis()
+```
+
+## Heatmap with sampled cells {.tabset}
+- Similar to dot plot above, showing expression in 100 random cells for each cluster   
+
+### Markers for each Cluster
+```{r, fig.height=5, fig.width=8}
+Idents(seuratObj.integrated) <- factor(Idents(seuratObj.integrated), levels = subtypes)
+# hgd()
+DoHeatmap(subset(seuratObj.integrated,
+    idents = hepatocytes, downsample = 100), features = top5$gene, size = 3) +
+    theme(legend.position = 'none', plot.margin = margin(t = 20))
+# dev.off()
+```
+
+### Markers in published papers
+```{r, fig.height=5, fig.width=8}
+Idents(seuratObj.integrated) <- factor(Idents(seuratObj.integrated), levels = subtypes)
+DoHeatmap(subset(seuratObj.integrated, idents = hepatocytes, downsample = 100),
+    features = c(markers_zonation, markers_zhu), size = 3) + NoLegend()
+```
+
+## GO Analysis
+== load GO plot lists
+```{r}
+plist <- readRDS("GO_plotlist.rds")
+```
+### use `plot_cluster_go` in `scillus`
+```{r, eval = FALSE}
+plist <- list()
+idx <- 1
+for (i in subtypes) {
+    c <- strsplit(i, '_')[[1]][2]
+    markers <- all.markers %>%
+        filter(cluster == c) %>%
+        mutate(cluster = str_replace(cluster, c, i))
+    plist[[idx]] <- plot_cluster_go(markers, cluster_name = i, org = "mouse", ont = "BP")
+    idx <- idx + 1
+}
+```
+
+```{r, eval = FALSE}
+saveRDS(plist, file = "GO_plotlist.rds")
+```
+### Plot all 
+```{r, fig.height=20, fig.width=16}
+ggarrange(plotlist = plist, align = 'v', nrow = 7, ncol = 2)
+```
+
+# DE genes per cluter (KO vs WT)
+== Load all cluster DE genes obj
+```{r}
+cluster_all.DEgenes <- readRDS("cluster_all.DEgenes.rds")
+# filter out mt genes
+# cluster_all.DEgenes <- cluster_all.DEgenes %>% filter(!grepl('mt-', gene))
+head(cluster_all.DEgenes)
+```
+
+## Find DE markers
+```{r, eval = FALSE}
+Idents(seuratObj.integrated) <- "seurat_clusters"
+
+cols <- c('gene', 'p_val', 'avg_log2FC', 'pct.1', 'pct.2', 'p_val_adj', 'cluster')
+cluster_all.DEgenes <- data.frame(matrix(nrow = 0, ncol = length(columns)))
+plan(multicore)
+for (c in 0:10) {
+    ## extract cluster obj
+    cluster_name <- paste0('cluster_', c)
+    print(cluster_name)
+    cluster_c <- subset(seuratObj.integrated, idents = c)
+    assign(cluster_name, cluster_c)
+    ## do DE for each cluster
+    cluster_DE_name <- paste0('cluster_', c, '.DEgenes')
+    Idents(cluster_c) <- "group"
+    cluster_c <- PrepSCTFindMarkers(cluster_c, assay = "SCT", verbose = TRUE)
+    markers <- FindMarkers(cluster_c,
+         assay = "SCT",
+        ident.1 = 'KO', ident.2 = 'WT', verbose = TRUE)
+    markers$gene <- rownames(markers)
+    markers <- markers %>% relocate(gene)
+    markers$cluster <- c
+    assign(cluster_DE_name, markers)
+    ## combine results
+    cluster_all.DEgenes <- rbind(cluster_all.DEgenes, markers)
+}
+plan(sequential)
+colnames(cluster_all.DEgenes) <- sub('pct.1', 'pct.ko', colnames(cluster_all.DEgenes))
+colnames(cluster_all.DEgenes) <- sub('pct.2', 'pct.wt', colnames(cluster_all.DEgenes))
+```
+
+## Save DE genes
+```{r, eval = FALSE}
+write_tsv(cluster_all.DEgenes, "cluster_all.DEgenes.tsv")
+
+saveRDS(cluster_all.DEgenes, file = "cluster_all.DEgenes.rds")
+```
+
+## DE results visulization
+### Heatmap of top5 up and down DE genes (all together)
+```{r, fig.height=18, fig.width=16}
+DE_up5 <- cluster_all.DEgenes %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC)
+
+DE_down5 <- cluster_all.DEgenes %>%
+    group_by(cluster) %>%
+    top_n(n = -5, wt = avg_log2FC)
+DE_diff5 <- rbind(DE_up5, DE_down5)
+
+DefaultAssay(seuratObj.integrated) <- "SCT"
+plot_heatmap(dataset = subset(seuratObj.integrated,
+                downsample = 100),
+    markers = DE_diff5,
+    sort_var = c("celltype_cluster", "group"),
+    anno_var = c("celltype_cluster", "group"),
+    anno_colors = list(colorRampPalette(brewer.pal(12, 'Paired'))(14),
+                c("red", "#ff8c00", "blue", "#00aaff"))
+)
+```
+
+### Dot plots using average expression {.tabset}
+- Combine 'celltype_cluster' and 'group' to new ident  
+```{r}
+# add new ident
+seuratObj.integrated@meta.data$celltype_cluster_group <- paste0(seuratObj.integrated$celltype_cluster, '_',
+    seuratObj.integrated$group)
+Idents(seuratObj.integrated) <- "celltype_cluster_group"
+Idents(seuratObj.integrated) <- factor(Idents(seuratObj.integrated),
+    levels = rev(c(paste0(subtypes, '_WT'),  paste0(subtypes, '_KO'))))
+```
+
+```{r, results = 'asis', fig.height=9, fig.width=10}
+for (i in subtypes) {
+    c <- strsplit(i, '_')[[1]][2]
+    DE_up5 <- cluster_all.DEgenes %>%
+        filter(cluster == c) %>%
+        top_n(n = 5, wt = avg_log2FC)
+
+    DE_down5 <- cluster_all.DEgenes %>%
+        filter(cluster == c) %>%
+        top_n(n = -5, wt = avg_log2FC)
+
+    cat('#### ', i, '\n')
+    p <- DotPlot(seuratObj.integrated, features = c(DE_up5$gene, DE_down5$gene),
+            cols = c("white", 'blue'), dot.scale = 8) +
+        RotatedAxis()
+    print(p)
+    cat('\n\n')
+}
+```
+
+### DE genes cooccurrence in cell types/clusters
+```{r}
+cluster_degene <- split(cluster_all.DEgenes$gene, cluster_all.DEgenes$cluster)
+hepatocytes_cluster <- cluster_degene[c('0', '2', '3')]
+```
+
+- KO vs WT DE genes for each cluster:
+```{r}
+table(cluster_all.DEgenes$cluster)
+```
+
+```{r, fig.height=9, fig.width=9}
+ggVennDiagram(hepatocytes_cluster, set_size = 6, label_alpha = 0, label_size = 6,
+    category.names = hepatocytes) +
+    scale_color_manual(values = rep('grey', 4)) +
+    scale_fill_gradient(low = "white", high = "red") +
+    scale_x_continuous(expand = expansion(mult = .2))
+```
+
+### GSEA on DEGs 
+- function modified from `Scillus`
+```{r}
+gsea <- function(diff, clusters = NULL, pathway) {
+    if (!requireNamespace("fgsea", quietly = TRUE)) {
+        stop(paste("Package \"fgsea\" needed for this function to work. Please install it."),
+                     call. = FALSE)
+    }
+    if (is.null(clusters)) clusters <- unique(diff$cluster)
+    gsea_res <- list()
+    for (i in seq(length(clusters))) {
+        data <- diff %>%
+            filter(.data$cluster == clusters[i]) %>%
+            arrange(desc(.data$avg_log2FC))
+        l <- data$avg_log2FC
+        names(l) <- data$gene
+        res <- fgsea::fgseaMultilevel(pathways = pathway,
+                            stats = l,
+                            minSize = 15,
+                            maxSize = 500)
+        res <- res %>% add_column(cluster = clusters[i], .before = 1)
+                gsea_res[[i]] <- res
+    }
+    return(as_tibble(do.call("rbind", gsea_res)))
+}
+
+```
+
+```{r}
+plot_gsea <- function(gsea_res, pattern = "HALLMARK_", p_cutoff = 0.05,
+                      colors = c('#dedcdb', "#ff0303")) {
+    gsea_res %>%
+            filter(.data$padj <= p_cutoff) %>%
+            mutate(pathway = str_remove(string = .data$pathway,
+                                        pattern = pattern)) %>%
+            mutate(color = -log10(.data$padj) * sign(.data$NES)) %>%
+            ggplot() +
+            geom_point(aes(x = factor(.data$pathway),
+                           y = factor(.data$cluster),
+                           size = abs(.data$NES),
+                           color = .data$color)) +
+            scale_size(name = "Normalized\nEnrichment\nScore Size") +
+            scale_color_gradient(name = bquote(-log[10]~"Adj. p-value"),
+                                  low = colors[1],
+                                  high = colors[2]) +
+            coord_flip() +
+            theme_bw() +
+            theme(axis.title.x = element_blank(),
+                  axis.title.y = element_blank())
+}
+```
+
+```{r}
+# load msigsb genesets
+h_gene_sets <- msigdbr(species = "mouse", category = "H")
+pathways.hallmark <- split(x = h_gene_sets$gene_symbol, f = h_gene_sets$gs_name)
+
+gsea_res <- gsea(cluster_all.DEgenes, pathway = pathways.hallmark)
+plot_gsea(gsea_res, p_cutoff = 0.05, colors = c("#2488f9", "#d7301f"))
+```

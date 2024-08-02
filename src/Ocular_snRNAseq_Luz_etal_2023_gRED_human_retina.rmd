@@ -1,0 +1,502 @@
+---
+title: "Ocular_snRNAseq_Luz_etal_2023_gRED_human_retina"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: yes
+    code_folding: hide
+---
+
+# Abstract
+This dataset was analyzed for the purpose of comparing GRK1 expression in the major two subtypes of photoreceptors (Rods vs Cones).   
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE,
+                    warning = FALSE,
+                    comment = "")
+```
+
+```{r}
+library(biomaRt)
+library(Seurat)
+library(SeuratDisk)
+library(BPCells)
+library(randomcoloR)
+library(data.table)
+library(Matrix)
+library(Azimuth)
+library(scCustomize)
+library(sctransform)
+library(glmGamPoi)
+library(tidyverse)
+library(reshape2)
+library(corrplot)
+library(future)
+options(future.globals.maxSize = 800 * 1024^2) # tested, use 600M
+library(openxlsx)
+library(patchwork)
+library(HGNChelper)
+library(httpgd)
+library(Scillus)
+library(fgsea)
+library(msigdbr)
+library(qs)
+library(knitr)
+Sys.setenv(PROJ_LIB = "/home/ubuntu/anaconda3/envs/r4.2.1/share/proj")
+Sys.setenv(GDAL_DATA = "/home/ubuntu/anaconda3/envs/r4.2.1/share/gdal")
+source("/mnt/data/apps/sc-type/R/gene_sets_prepare.R")
+source("/mnt/data/apps/sc-type/R/sctype_score_.R")
+setwd('~/Ocular_snRNAseq_publicdata_GRK1/human/Luz_etal_2023_gRED_human_retina')
+set.seed(123)
+```
+
+
+# Load downloaded count matrix object from cellxgene  
+```{r, eval = FALSE}
+df <- fread("SCP2012/broad_counts_new.csv.gz")
+df <- as.data.frame(df)
+rownames(df) <- df$GENE  # Set the gene names as row names
+df <- df[, -1]  
+sparse_mat <- Matrix(as.matrix(df), sparse = TRUE)
+
+metadata <- fread("SCP2012/broad_meta_new.tsv", sep = '\t')
+metadata <- as.data.frame(metadata[-1,]) %>% 
+    mutate(numeric_order = as.integer(gsub("[^0-9]", "", NAME))) %>%
+    arrange(numeric_order) %>%
+    select(-numeric_order) %>% select(c(biosample_id, AMD_status, Cell_type_full_clean, QC_pass))
+
+retina <- CreateSeuratObject(counts = sparse_mat, meta.data = metadata, project = "human_retina")
+
+# filter samples have a few cells
+colnames(retina@meta.data)[colnames(retina@meta.data) == "Cell_type_full_clean"] <- "cell_type"
+colnames(retina@meta.data)[colnames(retina@meta.data) == "biosample_id"] <- "sample"
+samples <- unique(retina$sample)
+
+# only use control samples
+Idents(retina) <- "AMD_status"
+retina <- subset(retina, idents = "Control")
+
+Idents(retina) <- "QC_pass"
+retina <- subset(retina, idents = "TRUE")
+```
+
+```{r}
+retina <- qread('retina.qs')
+```
+
+
+# QC and selecting cells for further analysis
+## QC
+
+- The object after pre-process
+```{r}
+retina
+table(retina$cell_type)
+head(retina, 5)
+```
+
+## Add %mitochondrial counts
+```{r, eval = FALSE}
+retina[["percent.mt"]] <- PercentageFeatureSet(retina, pattern = "^MT.")
+```
+
+## QC stats
+```{r}
+summary(retina$nCount_RNA)
+summary(retina$nFeature_RNA)
+summary(retina$percent.mt)
+```
+
+
+
+```{r, eval = FALSE}
+retina <- subset(retina, subset = percent.mt < 5 &
+    nFeature_RNA > 100 &
+    nCount_RNA > 200)
+```
+
+## QC metrics as a violin plot 
+- by donor
+```{r, fig.height=6, fig.width=12}
+VlnPlot(retina, layer = "counts", features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+    group.by = 'sample',
+    pt.size = 0, ncol = 3)
+```
+
+## filter cell types
+```{r, eval = FALSE}
+Idents(retina) <- "cell_type"
+retina <- subset(retina, idents = c('Amacrine', 'Bipolar', 'Rods', 'Cones', 'RGC', 'RPE', 'Muller', 'Horizontal'))
+```
+
+# SCTransform normalization, PCA and Clustering 
+```{r, eval = FALSE}
+# regressing out unwanted variation (mitochondrial, cell cyle, etc.)
+retina <- SCTransform(retina, method = "glmGamPoi", vst.flavor = "v2", return.only.var.genes = FALSE,
+        verbose = TRUE)
+```
+
+```{r, eval = FALSE}
+retina <- RunPCA(retina, npcs = 40)
+# ElbowPlot(retina, ndims = 40)
+retina <- RunUMAP(retina, reduction = "pca", dims = 1:30)
+retina <- FindNeighbors(retina, reduction = "pca", dims = 1:30)
+retina <- FindClusters(retina, resolution = 0.3)
+table(retina$seurat_clusters)
+```
+
+
+
+```{r, eval = FALSE}
+# qsave(retina, file = 'retina.qs')
+qsave(retina, file = '/home/chao/projects_chao/Ocular_snRNAseq_publicdata_GRK1/human/Luz_etal_2023_gRED_human_retina/retina.qs')
+```
+
+
+# Cell type annotation
+## Apply marker based tool `sc-type`
+```{r}
+sctype <- function(obj) {
+    # prepare marker genes from the database, category: Immune system, Liver, Pancreas, Kidney, Eye, Brain
+    gs_list <- gene_sets_prepare("/mnt/data/apps/sc-type/ScTypeDB_short_NHPeye.xlsx", "Eye")
+
+    # use a customized marker list
+    # gs_list <- gene_sets_prepare("./ocular_customized_markers.xlsx", "Eye")
+    # get cell-type by cell matrix
+    # NOTE: scRNAseqData parameter should correspond to your input scRNA-seq matrix.
+    # In case Seurat is used, it is either pbmc[["RNA"]]@scale.data (default),
+    # pbmc[["SCT"]]@scale.data, in case sctransform is used for normalization,
+    # or pbmc[["integrated"]]@scale.data, in case a joint analysis of multiple single-cell datasets is performed.
+    es.max <- sctype_score(scRNAseqData = obj[['SCT']]@scale.data, scaled = TRUE,
+                        gs = gs_list$gs_positive, gs2 = gs_list$gs_negative)
+
+    # merge by cluster
+    metadata <- obj@meta.data
+    clusters <- unique(obj@meta.data$seurat_clusters)
+    cL_resutls <- do.call("rbind",
+        lapply(
+            clusters,
+            function(cl) {
+                es.max.cl <- sort(rowSums(es.max[, rownames(metadata[metadata$seurat_clusters == cl, ])]),
+                    decreasing = TRUE)
+                cell_scores <- data.frame(cluster = cl,
+                        type = names(es.max.cl),
+                        scores = es.max.cl,
+                        ncells = sum(metadata$seurat_clusters == cl))
+                head(cell_scores, 10)
+            }
+        )
+    )
+    sctype_scores <- cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)
+
+    # set low-confident (low ScType score) clusters to "unknown"
+    sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] <- "Unknown"
+    print(data.frame(sctype_scores))
+
+    # add cell type annotations to obj
+    obj@meta.data$cell_type <- ""
+    for (j in unique(sctype_scores$cluster)){
+    cl_type <- sctype_scores[sctype_scores$cluster == j, ]
+    obj@meta.data$cell_type[obj@meta.data$seurat_clusters == j] <-
+        as.character(cl_type$type[1])
+    }
+    return(obj)
+}
+```
+
+```{r, eval = FALSE}
+retina <- sctype(retina)
+```
+
+
+## Show cell types on UMAP
+```{r, fig.height=12, fig.width=12}
+
+DimPlot(retina, reduction = "umap", label = TRUE, repel = TRUE,
+    group.by = 'cell_type') +
+    theme(legend.position = "top")
+table(retina$cell_type)
+```
+
+
+## Number of cells in each cell type
+```{r}
+plot_celltypes <- function(srat, celltype_col) {
+    cell_type <- srat@meta.data[[celltype_col]]
+    count_table <- table(srat@meta.data[[celltype_col]], srat@meta.data$sample)
+    count_mtx <- as.data.frame.matrix(count_table)
+    count_mtx$cell_type <- rownames(count_mtx)
+    melt_mtx <- melt(count_mtx)
+
+    celltype_size <- aggregate(value ~ cell_type, data = melt_mtx, FUN = sum)
+    celltype_size <- celltype_size %>% dplyr::arrange(value)
+    celltype_size$cell_type <- factor(celltype_size$cell_type, levels = celltype_size$cell_type)
+    melt_mtx$cell_type <- factor(melt_mtx$cell_type, levels = celltype_size$cell_type)
+    colnames(melt_mtx)[2] <- "sample"
+
+    p1 <- ggplot(celltype_size, aes(y = cell_type, x = value)) +
+    geom_bar(position = "dodge", stat = "identity", fill = "grey60") +
+    theme_bw() + scale_x_log10() + xlab("Cells per celltype, log10 scale") + ylab("")
+
+    p2 <- ggplot(melt_mtx, aes(x = cell_type, y = value, fill = sample)) +
+        geom_bar(position = "fill", stat = "identity") + theme_bw() + coord_flip() +
+        scale_fill_manual(values=as.vector(distinctColorPalette(20))) +
+        ylab("Fraction of cells in each sample") + xlab("celltype number") + theme(legend.position = "top")
+
+    p2 + p1 + plot_layout(widths = c(3, 1))
+}
+```
+
+```{r, fig.height=6, fig.width=14}
+plot_celltypes(retina, 'cell_type')
+```
+
+## plot % Rods and Cones for each sample/tissue/source
+```{r, fig.width=6, fig.height=6}
+Idents(retina) <- "cell_type"
+cell_type_to_plot <- c("Rods", 'Cones')
+percentage_data <-retina@meta.data %>%
+    count(sample, cell_type) %>%
+    # Calculate the percentage
+    group_by(sample) %>%
+    mutate(Percentage = n / sum(n)) %>%
+    filter(cell_type %in% cell_type_to_plot) %>%
+    ungroup()
+
+# pdf("Percent_RGC_per_sample.pdf", 8,6)
+ggplot(percentage_data, aes(x = sample, y = Percentage, fill = sample)) +
+    geom_bar(stat = "identity") +
+    labs(title = paste("Percentage of cells"), fill = "sample") +
+    theme_minimal() +
+    facet_wrap(~cell_type) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), plot.title = element_text(hjust = 0.5)) +
+    scale_y_continuous(labels = scales::percent) +
+    theme(plot.margin = margin(5, 5, 5, 20, "mm")) 
+# dev.off()
+```
+
+#  Cell markers analysis
+== Load all cluster markers obj
+```{r}
+all.markers <- readRDS("all.cluster_markers.rds")
+de_genes <- readRDS("de_genes_rod_vs_cone.rds")
+```
+
+## Find all markers
+```{r, eval = FALSE}
+Idents(retina) <- 'cell_type'
+retina <- PrepSCTFindMarkers(retina, assay = "SCT", verbose = TRUE)
+plan("multicore", workers = 12)
+all.markers <- FindAllMarkers(retina, assay = "SCT", min.pct = 0.1, verbose = TRUE)
+plan(sequential)
+```
+
+### Save marker genes
+```{r, eval = FALSE}
+all.markers <- all.markers %>% relocate(gene)
+write_tsv(all.markers, "all.cluster_markers.tsv")
+saveRDS(all.markers, file = "all.cluster_markers.rds")
+```
+
+### list top50 markers for Rods and Cones
+**Rods**  
+```{r}
+top50 <- all.markers %>%
+    group_by(cluster) %>%
+    slice_max(order_by = avg_log2FC, n = 50)
+    
+kable(top50 %>% filter(cluster %in% 'Rods'))
+```
+
+**Cones**  
+```{r}
+kable(top50 %>% filter(cluster %in% 'Cones'))
+```
+
+**GRK1 stats**
+```{r}
+kable(all.markers[all.markers$gene == "GRK1" & all.markers$cluster == 'Rods', ])
+```
+
+## Check Photoreceptors markers
+### Violin plots
+```{r, fig.height=16, fig.width=16}
+rod_markers <- c("GNAT1","PDE6B", "RHO", "ABCA4")
+cone_markers <- c("PDE6H", "PDE6C", "GNGT2", "ARR3")
+VlnPlot(object = retina, features = c("GRK1", rod_markers, cone_markers), pt.size = 0.01, combine = TRUE)
+```
+
+### UMAPs
+```{r, fig.height=8, fig.width=8}
+DimPlot(retina, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'cell_type') + theme(legend.position = "top")
+```
+
+```{r, fig.height=18, fig.width=18}
+FeaturePlot(object = retina, features = c("GRK1", rod_markers, cone_markers), label =TRUE, combine = TRUE)
+```
+
+### Dot plot for markers in each cell type
+- showing top markers with customized markers
+```{r, fig.height=8, fig.width=10}
+Idents(retina) <- "cell_type"
+DefaultAssay(retina) <- "SCT"
+top_genes <- all.markers %>%
+    filter(cluster %in% c('Rods', 'Cones')) %>%
+    group_by(cluster) %>%
+    slice_max(order_by = avg_log2FC, n = 10)
+
+# rod_markers <- c("GNAT1","PDE6B","SAMD11",'PITPNM3',"PRPH2")
+# cone_markers <- c("PDE6H", "PDE6C", "GNGT2", "ARR3","OPN1SW")
+
+# Specify any additional genes you want to label
+additional_genes <- c("GRK1", "RHO", "ABCA4", "ARR3")
+
+# Combine top genes and additional genes, ensuring uniqueness
+label_genes <- unique(c(top_genes$gene, additional_genes))
+# label_genes <- unique(c(rod_markers, cone_markers, additional_genes))
+
+DotPlot(retina, features = label_genes, cols = c("white", 'blue'), dot.scale = 8) +
+    RotatedAxis()
+```
+
+
+# Differential expression between Rods and Cones
+```{r, eval = FALSE}
+plan("multicore", workers = 12)
+## set minimum cutoffs to include GRK1 if it is not significantly different among the groups
+de_genes <- FindMarkers(retina, ident.1 = 'Rods', ident.2 = 'Cones', min.pct = 0.01, 
+    logfc.threshold = 0,
+    p_val = 1,
+    assay = "SCT", verbose = TRUE)
+plan(sequential)
+
+de_genes <- rownames_to_column(de_genes, var = "gene")
+write_tsv(de_genes, "de_genes_rod_vs_cone.tsv")
+saveRDS(de_genes, file = "de_genes_rod_vs_cone.rds")
+```
+
+```{r}
+up_gene <- de_genes %>%
+    slice_max(order_by = avg_log2FC, n = 50)
+
+down_gene <- de_genes %>%
+    slice_min(order_by = avg_log2FC, n = 50)
+```
+
+**Significantly up-regulated genes in Rods(top50)**
+```{r}
+kable(up_gene)
+```
+**Significantly up-regulated genes in Cones(top50)**
+```{r}
+kable(down_gene)
+```
+
+**GRK1 stats**
+```{r}
+kable(de_genes[de_genes$gene == "GRK1", ])
+```
+
+## volcano plot
+```{r}
+# Add a column for -log10(p-value)
+de_genes$p_val_adj_log10 <- -log10(de_genes$p_val_adj)
+
+# Determine the top 10 genes based on adjusted P-value
+top_genes <- de_genes %>%
+    slice_max(order_by = avg_log2FC, n = 5)
+
+bottom_genes <- de_genes %>%
+    slice_min(order_by = avg_log2FC, n = 5)
+
+# Specify any additional genes you want to label
+additional_genes <- c("GRK1", "RHO", "ABCA4", "ARR3")
+
+# Combine top genes and additional genes, ensuring uniqueness
+label_genes <- unique(c(top_genes$gene, bottom_genes$gene, additional_genes))
+
+# Create the volcano plot
+volcano_plot <- ggplot(de_genes, aes(x = avg_log2FC, y = p_val_adj_log10, label = gene)) +
+    geom_point(alpha = 0.5) + 
+    labs(title = "Volcano Plot of Differential Expression (Rod vs Cone)",
+        x = "Average Log2 Fold Change",
+        y = "-Log10 Adjusted P-Value") +
+    geom_text(data = filter(de_genes, gene %in% label_genes), vjust = 1.5, hjust = 0.5,  color = "red", check_overlap = TRUE) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 16, hjust = 0.5, margin = margin(b = 20)))
+
+# Print the plot
+print(volcano_plot)
+
+```
+
+
+# Plots to report
+
+## rename cell types
+```{r}
+rename_map <- c("Rods" = "Rod",
+                "Cones" = "Cone",
+                "Horizontal" = "HC",
+                "Amacrine" = "AC",
+                "Muller" = "MC",
+                "RGC" = "RGC",
+                "RPE" = "RPE",
+                "Bipolar" = "BC")
+
+retina$cell_type <- ifelse(retina$cell_type %in% names(rename_map), rename_map[retina$cell_type], retina$cell_type)
+Idents(retina) <- "cell_type"
+sub_retina <- subset(retina, idents = as.vector(rename_map))
+sub_retina$cell_type <- factor(sub_retina$cell_type, levels = c("Rod", "Cone", "HC", "BC", "AC", "RGC", "MC", "RPE"))
+table(sub_retina$cell_type)
+```
+
+## DotPlot for selected markers
+```{r}
+DefaultAssay(sub_retina) <- "SCT"
+Idents(sub_retina) <- "cell_type"
+
+markers <- c("GRK1", "GRK7", "ABCA4", "RHO", "NRL", "GNAT1", "ARR3", "GNAT2", 
+    "OPN1SW", "OPN1LW", "OPN1MW", "ONECUT1", "VSX2", "GAD1", "RBPMS", "RLBP1", "RPE65", "BEST1")
+```
+
+```{r}
+DotPlot(sub_retina, features = rev(markers), cols = c("white", 'blue'), dot.scale = 10, scale = TRUE) + RotatedAxis() + coord_flip()
+```
+
+
+## Heatmap for selected markers
+** randomly sample 100 cells for each cell type **
+```{r}
+DoHeatmap(subset(sub_retina, downsample = 100), features = markers, size = 3) +
+    theme(plot.margin = margin(t = 20))
+
+```
+
+** sample 10% of cells for each cell type **
+```{r}
+seurat_list <- SplitObject(sub_retina, split.by = "cell_type")
+# Sample 10% of cells from each cell type
+sampled_list <- lapply(seurat_list, function(x) {
+    # Calculate number of cells to sample
+    num_to_sample <- ceiling(ncol(x) * 0.10)
+    # Randomly sample cells
+    sampled_cells <- sample(colnames(x), num_to_sample)
+    # Subset the Seurat object for sampled cells
+    subset(x, cells = sampled_cells)
+})
+# Merge the sampled objects back into a single Seurat object
+sampled_sub_seurat <- Reduce(function(x, y) merge(x, y), sampled_list)
+sampled_sub_seurat$cell_type <- factor(sampled_sub_seurat$cell_type, levels = c("Rod", "Cone", "HC", "BC", "AC", "RGC", "MC", "RPE"))
+levels(sampled_sub_seurat$cell_type)
+```
+
+```{r}
+Idents(sampled_sub_seurat) <- 'cell_type'
+DoHeatmap(sampled_sub_seurat, features = markers, size = 3) +
+    theme(plot.margin = margin(t = 20))
+
+```
